@@ -3,3 +3,5 @@ opencv-python
 ultralytics
 scikit-learn
 joblib
+Flask
+requests

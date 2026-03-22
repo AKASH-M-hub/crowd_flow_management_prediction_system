@@ -1,0 +1,587 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Crowd Geospatial Intelligence Dashboard</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.css" />
+  <style>
+    body { font-family: Segoe UI, Tahoma, Arial, sans-serif; margin: 0; background: #f3f5f9; color: #1a2230; }
+    header { background: #101827; color: #f8fafc; padding: 14px 18px; }
+    .wrap { display: grid; grid-template-columns: 2fr 1fr; gap: 12px; padding: 12px; }
+    #map { width: 100%; height: 78vh; border: 2px solid #111827; border-radius: 10px; }
+    .panel { background: #ffffff; border: 1px solid #dbe2ee; border-radius: 10px; padding: 12px; }
+    .row { margin-bottom: 10px; }
+    .kpi-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+    .kpi { background: #0f172a; color: #f8fafc; border-radius: 8px; padding: 8px; }
+    .kpi .label { font-size: 12px; opacity: 0.85; }
+    .kpi .value { font-size: 22px; font-weight: 700; margin-top: 4px; }
+    input[type="text"] { width: 100%; padding: 8px; border: 1px solid #b8c2d6; border-radius: 6px; }
+    button { padding: 8px 10px; border: none; border-radius: 6px; background: #1d4ed8; color: #fff; cursor: pointer; }
+    button.secondary { background: #475569; }
+    .small { font-size: 12px; color: #5f6b7a; }
+    .risk { font-size: 20px; font-weight: 700; }
+    .safe { color: #16a34a; }
+    .medium { color: #ca8a04; }
+    .high { color: #ea580c; }
+    .very_high { color: #dc2626; }
+    .over { color: #dc2626; }
+    .list { max-height: 180px; overflow-y: auto; border: 1px solid #e2e8f0; border-radius: 6px; padding: 8px; }
+    .list-item { padding: 6px 0; border-bottom: 1px solid #edf2f7; }
+    .list-item:last-child { border-bottom: none; }
+    .inline-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+    select, input[type="number"] { width: 100%; padding: 8px; border: 1px solid #b8c2d6; border-radius: 6px; }
+    .leaflet-control-zoom a { width: 34px !important; height: 34px !important; line-height: 34px !important; font-size: 18px !important; }
+    .legend { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+    .badge { padding: 4px 8px; border-radius: 999px; font-size: 11px; font-weight: 700; color: #fff; }
+    .b-safe { background: #16a34a; }
+    .b-medium { background: #ca8a04; }
+    .b-high { background: #ea580c; }
+    .b-veryhigh { background: #dc2626; }
+    .b-over { background: #7f1d1d; }
+  </style>
+</head>
+<body>
+  <header>
+    <h2 style="margin:0;">Crowd Geospatial Intelligence Dashboard</h2>
+    <div class="small">Map -> Area Calculation -> Capacity Estimation -> AI Prediction -> Display</div>
+  </header>
+
+  <div class="wrap">
+    <div>
+      <div class="row panel">
+        <div class="row">
+          <input id="placeSearch" type="text" placeholder="Search location (e.g., Chennai, Madurai)" />
+        </div>
+        <div class="row">
+          <input id="originSearch" type="text" placeholder="Origin for directions (e.g., nearest station/hospital)" />
+        </div>
+        <div class="row">
+          <button id="btnRefreshAI">Refresh AI Data</button>
+          <button id="btnEvaluate" class="secondary">Evaluate Selected Zone</button>
+          <button id="btnNearby">Nearby Places</button>
+          <button id="btnDirections" class="secondary">Get Directions</button>
+        </div>
+        <div class="row inline-grid">
+          <div>
+            <label class="small" for="nearbyType">Nearby Type</label>
+            <select id="nearbyType">
+              <option value="transit_station">Transit Station</option>
+              <option value="hospital">Hospital</option>
+              <option value="police">Police</option>
+              <option value="school">School</option>
+              <option value="shopping_mall">Shopping Mall</option>
+            </select>
+          </div>
+          <div>
+            <label class="small" for="nearbyRadius">Radius (m)</label>
+            <input id="nearbyRadius" type="number" value="300" min="50" max="50000" />
+          </div>
+        </div>
+        <div class="row inline-grid">
+          <div>
+            <label class="small" for="mapTheme">Map Theme</label>
+            <select id="mapTheme">
+              <option value="bright">Bright Day</option>
+              <option value="street" selected>Street</option>
+              <option value="satellite">Satellite</option>
+            </select>
+          </div>
+          <div>
+            <label class="small" for="travelMode">Travel Mode</label>
+            <select id="travelMode">
+              <option value="walking">Walking</option>
+              <option value="driving">Driving</option>
+              <option value="bicycling">Bicycling</option>
+              <option value="transit">Transit</option>
+            </select>
+          </div>
+          <div>
+            <label class="small" for="nearbyKeyword">Keyword (optional)</label>
+            <input id="nearbyKeyword" type="text" placeholder="exit, metro, gate" />
+          </div>
+        </div>
+        <div class="small">Use map draw tools to draw polygon or rectangle around your target area.</div>
+      </div>
+      <div id="map"></div>
+    </div>
+
+    <div>
+      <div class="panel row">
+        <h3 style="margin: 0 0 8px 0;">AI Inputs (From Existing Model)</h3>
+        <div>Current Count: <strong id="aiCurrent">-</strong></div>
+        <div>Predicted Count: <strong id="aiPredicted">-</strong></div>
+        <div>Confidence: <strong id="aiConfidence">-</strong></div>
+        <div>Mode: <strong id="aiMode">-</strong></div>
+        <div>Status: <strong id="aiStatus">-</strong></div>
+        <div class="small" id="aiMessage"></div>
+      </div>
+
+      <div class="panel row">
+        <h3 style="margin: 0 0 8px 0;">Geospatial Output</h3>
+        <div>Area (m2): <strong id="areaOut">-</strong></div>
+        <div>Perimeter (m): <strong id="perimeterOut">-</strong></div>
+        <div>Zone Centroid: <strong id="zoneCentroid">-</strong></div>
+        <div>Zone Address: <strong id="zoneAddress">-</strong></div>
+      </div>
+
+      <div class="panel row">
+        <h3 style="margin: 0 0 8px 0;">Capacity Estimation</h3>
+        <div class="kpi-grid">
+          <div class="kpi"><div class="label">Low (1/m2)</div><div class="value" id="capLow">-</div></div>
+          <div class="kpi"><div class="label">Safe (2/m2)</div><div class="value" id="capSafe">-</div></div>
+          <div class="kpi"><div class="label">Max (4/m2)</div><div class="value" id="capMax">-</div></div>
+          <div class="kpi"><div class="label">Predicted Crowd</div><div class="value" id="capPred">-</div></div>
+        </div>
+        <div class="small" style="margin-top:8px;">Recommended Max Capacity: <strong id="recommendedMax">-</strong></div>
+        <div class="small">Usable Area: <strong id="usableArea">-</strong> m2 (<strong id="usableRatio">-</strong>)</div>
+      </div>
+
+      <div class="panel row">
+        <h3 style="margin: 0 0 8px 0;">Risk Assessment</h3>
+        <div>Current Risk: <strong id="riskCurrent">-</strong></div>
+        <div>Predicted Risk: <strong id="riskPredicted">-</strong></div>
+        <div class="risk" id="riskOverall">-</div>
+        <div class="legend">
+          <span class="badge b-safe">SAFE</span>
+          <span class="badge b-medium">MEDIUM</span>
+          <span class="badge b-high">HIGH</span>
+          <span class="badge b-veryhigh">VERY_HIGH</span>
+          <span class="badge b-over">OVERCROWD</span>
+        </div>
+      </div>
+
+      <div class="panel row">
+        <h3 style="margin: 0 0 8px 0;">Directions Intelligence</h3>
+        <div>Distance: <strong id="dirDistance">-</strong></div>
+        <div>Duration: <strong id="dirDuration">-</strong></div>
+        <div>From: <strong id="dirStart">-</strong></div>
+        <div>To: <strong id="dirEnd">-</strong></div>
+      </div>
+
+      <div class="panel row">
+        <h3 style="margin: 0 0 8px 0;">Nearby Critical Places</h3>
+        <div class="small" id="nearbyMeta">No nearby places loaded.</div>
+        <div id="nearbyList" class="list"></div>
+      </div>
+
+      <div class="panel row">
+        <h3 style="margin: 0 0 8px 0;">Map Services</h3>
+        <div id="mapsHealth">Checking...</div>
+      </div>
+    </div>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+  <script src="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.js"></script>
+  <script>
+    let map;
+    let selectedLayer = null;
+    let drawnItems;
+    let centroidMarker = null;
+    let routeLine = null;
+    let nearbyMarkers = [];
+    let baseLayers = {};
+    let activeBaseLayer = null;
+    let selectedCoordinates = [];
+    let aiData = null;
+
+    function riskClass(risk) {
+      if (risk === "SAFE") return "safe";
+      if (risk === "MEDIUM") return "medium";
+      if (risk === "HIGH") return "high";
+      if (risk === "VERY_HIGH") return "very_high";
+      return "over";
+    }
+
+    function riskFillColor(risk) {
+      if (risk === 'SAFE') return '#22c55e';
+      if (risk === 'MEDIUM') return '#f59e0b';
+      if (risk === 'HIGH') return '#f97316';
+      if (risk === 'VERY_HIGH') return '#ef4444';
+      return '#7f1d1d';
+    }
+
+    function clearShape() {
+      if (selectedLayer) {
+        drawnItems.removeLayer(selectedLayer);
+      }
+      selectedLayer = null;
+      selectedCoordinates = [];
+      if (centroidMarker) {
+        map.removeLayer(centroidMarker);
+        centroidMarker = null;
+      }
+      if (routeLine) {
+        map.removeLayer(routeLine);
+        routeLine = null;
+      }
+    }
+
+    function shapeToCoordinates(layer) {
+      if (!layer) return [];
+
+      if (layer instanceof L.Polygon && !(layer instanceof L.Rectangle)) {
+        const points = layer.getLatLngs()[0] || [];
+        return points.map((p) => ({ lat: p.lat, lng: p.lng }));
+      }
+
+      if (layer instanceof L.Rectangle) {
+        const b = layer.getBounds();
+        const nw = b.getNorthWest();
+        const ne = b.getNorthEast();
+        const se = b.getSouthEast();
+        const sw = b.getSouthWest();
+        return [
+          { lat: nw.lat, lng: nw.lng },
+          { lat: ne.lat, lng: ne.lng },
+          { lat: se.lat, lng: se.lng },
+          { lat: sw.lat, lng: sw.lng },
+        ];
+      }
+
+      return [];
+    }
+
+    function updateCentroidMarker(centroid) {
+      if (!centroid) return;
+      if (centroidMarker) {
+        map.removeLayer(centroidMarker);
+      }
+      centroidMarker = L.marker([centroid.lat, centroid.lng]).addTo(map);
+    }
+
+    async function geocodeAddress(query) {
+      const res = await fetch('/api/geospatial/geocode', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query })
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.error || 'Geocode failed');
+      }
+      if (!data.results || !data.results.length) {
+        throw new Error('No matching address found');
+      }
+      return data.results[0];
+    }
+
+    async function loadMapsHealth() {
+      const res = await fetch('/api/maps/health');
+      const data = await res.json();
+      const provider = data.provider || 'unknown';
+      document.getElementById('mapsHealth').textContent = 'Provider: ' + provider.toUpperCase() + ' | ' + data.message;
+    }
+
+    async function loadZoneAddress(coords) {
+      const res = await fetch('/api/geospatial/reverse-geocode', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ coordinates: coords })
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        document.getElementById('zoneAddress').textContent = data.error || 'Address lookup failed';
+        return;
+      }
+
+      const centroidText = data.centroid.lat.toFixed(6) + ', ' + data.centroid.lng.toFixed(6);
+      document.getElementById('zoneCentroid').textContent = centroidText;
+      document.getElementById('zoneAddress').textContent = data.formatted_address;
+      updateCentroidMarker(data.centroid);
+    }
+
+    async function loadNearbyPlaces() {
+      if (!selectedCoordinates.length) {
+        alert('Draw and evaluate a zone first.');
+        return;
+      }
+
+      const placeType = document.getElementById('nearbyType').value;
+      const radius = Number(document.getElementById('nearbyRadius').value || 300);
+      const keyword = document.getElementById('nearbyKeyword').value.trim();
+      const res = await fetch('/api/geospatial/nearby-places', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          coordinates: selectedCoordinates,
+          place_type: placeType,
+          radius_m: radius,
+          keyword: keyword,
+        })
+      });
+
+      const data = await res.json();
+      if (!res.ok) {
+        alert(data.error || 'Nearby places request failed');
+        return;
+      }
+
+      document.getElementById('nearbyMeta').textContent = 'Found ' + data.count + ' place(s) in ' + data.radius_m + 'm';
+      const list = document.getElementById('nearbyList');
+      list.innerHTML = '';
+      nearbyMarkers.forEach((m) => map.removeLayer(m));
+      nearbyMarkers = [];
+
+      if (!data.places.length) {
+        list.innerHTML = '<div class="list-item">No matching places found.</div>';
+        return;
+      }
+
+      data.places.forEach((p) => {
+        const div = document.createElement('div');
+        div.className = 'list-item';
+        const rating = p.rating ? (' | Rating: ' + p.rating) : '';
+        div.textContent = p.name + ' - ' + p.vicinity + rating;
+        list.appendChild(div);
+
+        if (p.location && p.location.lat && p.location.lng) {
+          const marker = L.marker([p.location.lat, p.location.lng]).addTo(map);
+          marker.bindPopup('<strong>' + p.name + '</strong><br/>' + p.vicinity);
+          nearbyMarkers.push(marker);
+        }
+      });
+
+      if (nearbyMarkers.length) {
+        const group = L.featureGroup(nearbyMarkers);
+        map.fitBounds(group.getBounds().pad(0.25));
+      }
+    }
+
+    async function loadDirections() {
+      if (!selectedCoordinates.length) {
+        alert('Draw and evaluate a zone first.');
+        return;
+      }
+
+      const originText = document.getElementById('originSearch').value.trim();
+      if (!originText) {
+        alert('Enter an origin location first.');
+        return;
+      }
+
+      let origin;
+      try {
+        const found = await geocodeAddress(originText);
+        origin = { lat: found.lat, lng: found.lng };
+      } catch (error) {
+        alert(error.message || 'Could not geocode origin address');
+        return;
+      }
+
+      const mode = document.getElementById('travelMode').value;
+      const res = await fetch('/api/geospatial/directions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          coordinates: selectedCoordinates,
+          origin,
+          mode,
+        })
+      });
+      const data = await res.json();
+      if (!res.ok || data.status !== 'OK') {
+        alert((data && data.error) || 'Directions lookup failed');
+        return;
+      }
+
+      document.getElementById('dirDistance').textContent = data.distance_text;
+      document.getElementById('dirDuration').textContent = data.duration_text;
+      document.getElementById('dirStart').textContent = data.start_address;
+      document.getElementById('dirEnd').textContent = data.end_address;
+
+      if (routeLine) {
+        map.removeLayer(routeLine);
+      }
+      if (data.route_geometry && data.route_geometry.length) {
+        const points = data.route_geometry.map((p) => [p.lat, p.lng]);
+        routeLine = L.polyline(points, { color: '#f43f5e', weight: 4 }).addTo(map);
+      } else {
+        routeLine = L.polyline([
+          [origin.lat, origin.lng],
+          [data.destination.lat, data.destination.lng],
+        ], { color: '#f43f5e', weight: 4 }).addTo(map);
+      }
+    }
+
+    async function refreshAI() {
+      const res = await fetch('/api/ai/latest');
+      const data = await res.json();
+      const msg = document.getElementById('aiMessage');
+
+      if (!data.available) {
+        document.getElementById('aiCurrent').textContent = '-';
+        document.getElementById('aiPredicted').textContent = '-';
+        document.getElementById('aiConfidence').textContent = '-';
+        document.getElementById('aiMode').textContent = '-';
+        document.getElementById('aiStatus').textContent = '-';
+        msg.textContent = data.message || 'AI data unavailable';
+        aiData = null;
+        return;
+      }
+
+      aiData = data.ai;
+      document.getElementById('aiCurrent').textContent = aiData.current_count;
+      document.getElementById('aiPredicted').textContent = aiData.future_count;
+      document.getElementById('aiConfidence').textContent = aiData.confidence_percent + '%';
+      document.getElementById('aiMode').textContent = aiData.prediction_mode;
+      document.getElementById('aiStatus').textContent = aiData.status;
+      msg.textContent = 'Latest row from prediction_output_log.csv';
+    }
+
+    async function evaluateSelectedZone() {
+      if (!selectedLayer) {
+        alert('Draw a polygon or rectangle first.');
+        return;
+      }
+
+      const coords = shapeToCoordinates(selectedLayer);
+      if (coords.length < 3) {
+        alert('Need at least 3 coordinates.');
+        return;
+      }
+
+      const payload = { coordinates: coords };
+      selectedCoordinates = coords;
+      if (aiData) {
+        payload.current_count = aiData.current_count;
+        payload.predicted_count = aiData.future_count;
+      }
+
+      const res = await fetch('/api/geospatial/evaluate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+
+      const data = await res.json();
+      if (!res.ok) {
+        alert(data.error || 'Failed to evaluate zone');
+        return;
+      }
+
+      document.getElementById('areaOut').textContent = data.area_m2;
+      document.getElementById('perimeterOut').textContent = data.perimeter_m;
+      if (data.centroid) {
+        document.getElementById('zoneCentroid').textContent = data.centroid.lat.toFixed(6) + ', ' + data.centroid.lng.toFixed(6);
+        updateCentroidMarker(data.centroid);
+      }
+      document.getElementById('capLow').textContent = data.capacities.low_density_capacity;
+      document.getElementById('capSafe').textContent = data.capacities.safe_capacity;
+      document.getElementById('capMax').textContent = data.capacities.maximum_capacity;
+      document.getElementById('capPred').textContent = data.predicted_count;
+
+      if (data.capacity_model) {
+        document.getElementById('recommendedMax').textContent = data.capacity_model.recommended_max_capacity;
+        document.getElementById('usableArea').textContent = data.capacity_model.usable_area_m2;
+        document.getElementById('usableRatio').textContent = (data.capacity_model.usable_ratio * 100).toFixed(1) + '%';
+      }
+
+      document.getElementById('riskCurrent').textContent = data.current_risk;
+      document.getElementById('riskPredicted').textContent = data.predicted_risk;
+      const overall = document.getElementById('riskOverall');
+      overall.textContent = 'Overall Risk: ' + data.overall_risk;
+      overall.className = 'risk ' + riskClass(data.overall_risk);
+
+      if (selectedLayer && selectedLayer.setStyle) {
+        selectedLayer.setStyle({
+          color: riskFillColor(data.overall_risk),
+          fillColor: riskFillColor(data.overall_risk),
+          fillOpacity: 0.35,
+          weight: 3,
+        });
+      }
+
+      await loadZoneAddress(coords);
+    }
+
+    async function focusSearchLocation() {
+      const query = document.getElementById('placeSearch').value.trim();
+      if (!query) {
+        return;
+      }
+      try {
+        const result = await geocodeAddress(query);
+        map.setView([result.lat, result.lng], 14);
+      } catch (error) {
+        alert(error.message || 'Location search failed');
+      }
+    }
+
+    function initMap() {
+      map = L.map('map').setView([20.5937, 78.9629], 5);
+
+      baseLayers.bright = L.tileLayer('https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png', {
+        maxZoom: 20,
+        attribution: '&copy; OpenStreetMap contributors &copy; CARTO'
+      });
+      baseLayers.street = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        maxZoom: 19,
+        attribution: '&copy; OpenStreetMap contributors'
+      });
+      baseLayers.satellite = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+        maxZoom: 19,
+        attribution: 'Tiles &copy; Esri'
+      });
+
+      activeBaseLayer = baseLayers.street;
+      activeBaseLayer.addTo(map);
+
+      document.getElementById('mapTheme').addEventListener('change', (event) => {
+        const selected = event.target.value;
+        const nextLayer = baseLayers[selected] || baseLayers.bright;
+        if (activeBaseLayer) {
+          map.removeLayer(activeBaseLayer);
+        }
+        activeBaseLayer = nextLayer;
+        activeBaseLayer.addTo(map);
+      });
+
+      drawnItems = new L.FeatureGroup();
+      map.addLayer(drawnItems);
+
+      const drawControl = new L.Control.Draw({
+        edit: {
+          featureGroup: drawnItems,
+          edit: false,
+          remove: false,
+        },
+        draw: {
+          polygon: true,
+          rectangle: true,
+          marker: false,
+          polyline: false,
+          circle: false,
+          circlemarker: false,
+        },
+      });
+      map.addControl(drawControl);
+
+      map.on(L.Draw.Event.CREATED, (event) => {
+        clearShape();
+        selectedLayer = event.layer;
+        drawnItems.addLayer(selectedLayer);
+        selectedCoordinates = shapeToCoordinates(selectedLayer);
+      });
+
+      document.getElementById('btnRefreshAI').addEventListener('click', refreshAI);
+      document.getElementById('btnEvaluate').addEventListener('click', evaluateSelectedZone);
+      document.getElementById('btnNearby').addEventListener('click', loadNearbyPlaces);
+      document.getElementById('btnDirections').addEventListener('click', loadDirections);
+      document.getElementById('placeSearch').addEventListener('keydown', (event) => {
+        if (event.key === 'Enter') {
+          event.preventDefault();
+          focusSearchLocation();
+        }
+      });
+
+      refreshAI();
+      loadMapsHealth();
+    }
+
+    initMap();
+  </script>
+</body>
+</html>

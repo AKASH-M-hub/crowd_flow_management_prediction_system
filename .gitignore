@@ -1,2 +1,4 @@
 
 data/crowd_videos/long_demo.mp4
+__pycache__/
+*.pyc

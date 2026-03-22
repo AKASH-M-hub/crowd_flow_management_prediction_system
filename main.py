@@ -1,5 +1,6 @@
 import cv2
 import time
+import json
 import numpy as np
 from collections import Counter
 
@@ -9,7 +10,8 @@ from processing.detection import detect_people
 
 from processing.flow_analysis import calculate_flow
 from processing.congestion import detect_congestion
-from processing.time_series import predict_future_crowd
+from processing.crowd_predictor import CrowdPredictor
+from processing.prediction_engine import build_prediction_snapshot, load_metrics_txt
 from processing.risk_analysis import analyze_risk
 
 from dashboard.visualization import (
@@ -20,6 +22,7 @@ from dashboard.visualization import (
     draw_flow,
     draw_global_flow_indicator,
     draw_high_crowd_popup,
+    draw_future_prediction_popup,
 )
 from processing.tracker import SimpleTracker
 
@@ -30,8 +33,17 @@ DETECTION_INTERVAL = 2
 ZOOM_PASS_INTERVAL = 2
 PREVIEW_WINDOW_NAME = "Detected Person Preview"
 PREVIEW_SIZE = (360, 300)
+PREDICTION_START_PERCENT = 10.0
+PREDICTION_LOG_PATH = "prediction_output_log.csv"
+PREDICTION_JSONL_PATH = "prediction_output_log.jsonl"
+PREDICTION_ALERTS_PATH = "prediction_alert_events.txt"
+PREDICTION_ALERTS_SUMMARY_PATH = "prediction_alert_summary.md"
+PREDICTION_METRICS_PATH = "models/crowd_predictor_metrics.txt"
+ALERT_MIN_CONFIDENCE_PERCENT = 60.0
+ALERT_MIN_STREAK = 3
 
 count_history = []
+density_history = []
 
 
 def _update_unique_gallery(frame, tracked_objects, unique_gallery):
@@ -130,6 +142,8 @@ def _build_preview_frame(frame, unique_gallery, ordered_ids, page_index):
 
 
 def main():
+    count_history.clear()
+    density_history.clear()
 
     cv2.setUseOptimized(True)
     cv2.namedWindow(PREVIEW_WINDOW_NAME, cv2.WINDOW_NORMAL)
@@ -138,7 +152,18 @@ def main():
     model = load_model()
     cap = load_video(VIDEO_PATH)
 
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
     tracker = SimpleTracker()
+    predictor = CrowdPredictor(
+        model_path="models/crowd_predictor.joblib",
+        window_size=24,
+        horizon_steps=15,
+    )
+    if not predictor.is_trained():
+        raise RuntimeError("NN model not found. Train first using train_crowd_predictor.py before running main.py")
+
+    prediction_metrics = load_metrics_txt(PREDICTION_METRICS_PATH)
 
     all_counts = []
     all_status = []
@@ -151,107 +176,242 @@ def main():
     unique_gallery = {}
     preview_page = 0
     preview_sequence = []
+    prediction_started = False
+    incoming_streak = 0
+    last_incoming = False
+    alert_events = []
+    prediction_log = open(PREDICTION_LOG_PATH, "w", encoding="utf-8")
+    prediction_jsonl = open(PREDICTION_JSONL_PATH, "w", encoding="utf-8")
+    prediction_alerts = open(PREDICTION_ALERTS_PATH, "w", encoding="utf-8")
+    prediction_alerts.write("frame,elapsed_percent,current_count,future_count,delta,confidence_percent,action_recommendation,gate_reason\n")
 
-    while cap.isOpened():
-        ret, frame = read_frame(cap)
-        if not ret:
-            break
+    prediction_log.write(
+        "frame,elapsed_percent,current_count,future_count,delta,incoming_raw,incoming,incoming_threshold,incoming_streak,confidence_percent,alert_score,risk_hint,prediction_mode,nn_pred,nn_ready,density_ratio,status\n"
+    )
 
-        frame_count += 1
+    try:
+        while cap.isOpened():
+            ret, frame = read_frame(cap)
+            if not ret:
+                break
 
-        frame = cv2.resize(frame, DISPLAY_SIZE)
+            frame_count += 1
+            frame = cv2.resize(frame, DISPLAY_SIZE)
 
-        # 🔍 Detection
-        if frame_count % DETECTION_INTERVAL == 0:
-            detection_step += 1
-            use_zoom = (detection_step % ZOOM_PASS_INTERVAL == 0)
-            boxes = detect_people(model, frame, use_zoom=use_zoom)
-            objects = tracker.update(boxes)
-            last_boxes = boxes
-            last_objects = objects
+            # 🔍 Detection
+            if frame_count % DETECTION_INTERVAL == 0:
+                detection_step += 1
+                use_zoom = (detection_step % ZOOM_PASS_INTERVAL == 0)
+                boxes = detect_people(model, frame, use_zoom=use_zoom)
+                objects = tracker.update(boxes)
+                last_boxes = boxes
+                last_objects = objects
+            else:
+                boxes = last_boxes
+                objects = last_objects
+
+            # 🔁 Tracking output
+            object_centers = {obj_id: ((x1 + x2) // 2, (y1 + y2) // 2) for x1, y1, x2, y2, obj_id in objects}
+            display_centers = object_centers
+
+            # 📊 Count + density
+            tracked_count = len(objects)
+            count_history.append(tracked_count)
+
+            frame_area = max(1, frame.shape[0] * frame.shape[1])
+            box_area_sum = 0
+            for x1, y1, x2, y2 in boxes:
+                box_area_sum += max(0, x2 - x1) * max(0, y2 - y1)
+            density_ratio = min(1.0, box_area_sum / frame_area)
+            density_history.append(float(density_ratio))
+
+            recent_window = count_history[-10:]
+            count = int(round(sum(recent_window) / len(recent_window)))
+
+            elapsed_ratio = frame_count / total_frames if total_frames > 0 else 0.0
+            elapsed_percent = elapsed_ratio * 100.0
+            prediction_active = elapsed_percent > PREDICTION_START_PERCENT
+            if prediction_active and not prediction_started:
+                prediction_started = True
+                print(f"Prediction started at frame {frame_count} ({elapsed_percent:.2f}%).")
+
+            nn_ready = prediction_active and predictor.is_trained() and len(count_history) >= predictor.window_size
+            if nn_ready:
+                nn_pred = predictor.predict(count_history, density_history, elapsed_ratio)
+            else:
+                nn_pred = count
+
+            pre_snapshot = build_prediction_snapshot(
+                current_count=count,
+                nn_pred=nn_pred,
+                count_history=count_history,
+                metrics=prediction_metrics,
+                prediction_active=prediction_active,
+                nn_ready=nn_ready,
+                incoming_streak=incoming_streak,
+                min_confidence_percent=ALERT_MIN_CONFIDENCE_PERCENT,
+                min_streak=ALERT_MIN_STREAK,
+            )
+
+            if pre_snapshot.incoming_raw:
+                incoming_streak += 1
+            else:
+                incoming_streak = 0
+
+            snapshot = build_prediction_snapshot(
+                current_count=count,
+                nn_pred=nn_pred,
+                count_history=count_history,
+                metrics=prediction_metrics,
+                prediction_active=prediction_active,
+                nn_ready=nn_ready,
+                incoming_streak=incoming_streak,
+                min_confidence_percent=ALERT_MIN_CONFIDENCE_PERCENT,
+                min_streak=ALERT_MIN_STREAK,
+            )
+
+            future_count = snapshot.future_count if prediction_active else count
+
+            # 🚨 Congestion
+            congestion_level = detect_congestion(boxes, frame.shape)
+
+            # 🧠 Risk
+            risk_status = analyze_risk(count, future_count, congestion_level)
+
+            all_counts.append(count)
+            all_status.append(risk_status)
+
+            # 🎨 DRAWING SECTION
+            draw_boxes(frame, boxes)
+            frame = draw_heatmap(frame, boxes)
+            draw_ids(frame, display_centers)
+            frame = draw_flow(frame, tracker)
+            draw_text(frame, count, future_count, risk_status)
+
+            # 🔥 TITLE
+            cv2.putText(frame, "AI CROWD INTELLIGENCE SYSTEM",
+                        (120, 20),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6,
+                        (255, 255, 255),
+                        2)
+
+            # 🔥 BORDER
+            cv2.rectangle(frame, (0, 0),
+                          (frame.shape[1], frame.shape[0]),
+                          (0, 255, 255), 2)
+
+            # 🔥 FLOW DIRECTION ANALYSIS
+            flow = calculate_flow(tracker)
+            frame = draw_global_flow_indicator(frame, flow)
+
+            # Dynamic hotspot popup appears at the densest crowd area in the frame.
+            show_hotspot_popup = risk_status in ("HIGH", "CRITICAL")
+            frame = draw_high_crowd_popup(frame, boxes, show_hotspot_popup)
+
+            frame = draw_future_prediction_popup(frame, snapshot, elapsed_percent, prediction_active)
+
+            # ⚡ FPS
+            curr_time = time.time()
+            fps = 1 / (curr_time - prev_time) if prev_time != 0 else 0
+            prev_time = curr_time
+
+            cv2.putText(frame, f"FPS: {int(fps)}",
+                        (20, 200),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7,
+                        (255, 255, 0),
+                        2)
+
+            cv2.imshow("Crowd Intelligence System", frame)
+
+            new_ids = _update_unique_gallery(frame, objects, unique_gallery)
+            if new_ids:
+                preview_sequence.extend(new_ids)
+
+            if frame_count % 20 == 0 and preview_sequence:
+                max_page = max(0, (len(preview_sequence) - 1) // 4)
+                preview_page = min(preview_page + 1, max_page)
+
+            preview_frame = _build_preview_frame(frame, unique_gallery, preview_sequence, preview_page)
+            cv2.imshow(PREVIEW_WINDOW_NAME, preview_frame)
+
+            if prediction_active and frame_count % DETECTION_INTERVAL == 0:
+                prediction_log.write(
+                    f"{frame_count},{elapsed_percent:.3f},{snapshot.current_count},{snapshot.future_count},{snapshot.delta},{int(snapshot.incoming_raw)},{int(snapshot.incoming)},{snapshot.incoming_threshold},{snapshot.incoming_streak},{snapshot.confidence_percent:.1f},{snapshot.alert_score:.3f},{snapshot.risk_hint},{snapshot.prediction_mode},{snapshot.nn_pred},{int(snapshot.nn_ready)},{density_ratio:.6f},{risk_status}\n"
+                )
+
+                prediction_jsonl.write(
+                    json.dumps(
+                        {
+                            "frame": frame_count,
+                            "elapsed_percent": round(elapsed_percent, 3),
+                            "current_count": snapshot.current_count,
+                            "future_count": snapshot.future_count,
+                            "delta": snapshot.delta,
+                            "incoming_raw": bool(snapshot.incoming_raw),
+                            "incoming": bool(snapshot.incoming),
+                            "incoming_threshold": snapshot.incoming_threshold,
+                            "incoming_streak": snapshot.incoming_streak,
+                            "confidence_percent": snapshot.confidence_percent,
+                            "incoming_probability_percent": snapshot.incoming_probability_percent,
+                            "alert_score": snapshot.alert_score,
+                            "risk_hint": snapshot.risk_hint,
+                            "gate_reason": snapshot.gate_reason,
+                            "action_recommendation": snapshot.action_recommendation,
+                            "prediction_mode": snapshot.prediction_mode,
+                            "nn_pred": snapshot.nn_pred,
+                            "nn_ready": bool(snapshot.nn_ready),
+                            "density_ratio": round(density_ratio, 6),
+                            "status": risk_status,
+                        }
+                    )
+                    + "\n"
+                )
+
+                if snapshot.incoming and not last_incoming:
+                    prediction_alerts.write(
+                        f"{frame_count},{elapsed_percent:.3f},{snapshot.current_count},{snapshot.future_count},{snapshot.delta},{snapshot.confidence_percent:.1f},{snapshot.action_recommendation},{snapshot.gate_reason}\n"
+                    )
+                    alert_events.append(
+                        {
+                            "frame": frame_count,
+                            "elapsed_percent": round(elapsed_percent, 3),
+                            "current_count": snapshot.current_count,
+                            "future_count": snapshot.future_count,
+                            "delta": snapshot.delta,
+                            "confidence_percent": snapshot.confidence_percent,
+                            "incoming_probability_percent": snapshot.incoming_probability_percent,
+                            "action_recommendation": snapshot.action_recommendation,
+                            "gate_reason": snapshot.gate_reason,
+                        }
+                    )
+                last_incoming = bool(snapshot.incoming)
+
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+    finally:
+        prediction_log.close()
+        prediction_jsonl.close()
+        prediction_alerts.close()
+
+    with open(PREDICTION_ALERTS_SUMMARY_PATH, "w", encoding="utf-8") as f:
+        f.write("# Prediction Alert Summary\n\n")
+        f.write(f"- Total Alerts: {len(alert_events)}\n")
+        if alert_events:
+            first = alert_events[0]
+            peak = max(alert_events, key=lambda e: e["incoming_probability_percent"])
+            f.write(f"- First Alert: frame {first['frame']} at {first['elapsed_percent']:.3f}%\n")
+            f.write(
+                f"- Peak Alert Probability: {peak['incoming_probability_percent']:.1f}% (frame {peak['frame']}, delta +{peak['delta']})\n\n"
+            )
+            f.write("## Alert Events\n\n")
+            for i, event in enumerate(alert_events, start=1):
+                f.write(
+                    f"{i}. Frame {event['frame']} ({event['elapsed_percent']:.3f}%): Current {event['current_count']} -> Future {event['future_count']} (Delta {event['delta']:+d}), Confidence {event['confidence_percent']:.1f}%, Incoming Probability {event['incoming_probability_percent']:.1f}%, Action {event['action_recommendation']}, Gate {event['gate_reason']}\n"
+                )
         else:
-            boxes = last_boxes
-            objects = last_objects
-
-        # 🔁 Tracking output
-        object_centers = {obj_id: ((x1 + x2) // 2, (y1 + y2) // 2) for x1, y1, x2, y2, obj_id in objects}
-        display_centers = object_centers
-
-        # 📊 Count + density
-        tracked_count = len(objects)
-        count_history.append(tracked_count)
-        recent_window = count_history[-10:]
-        count = int(round(sum(recent_window) / len(recent_window)))
-
-        # 🔮 Prediction (REAL regression-based)
-        future_count = predict_future_crowd(count_history)
-
-        # 🚨 Congestion
-        congestion_level = detect_congestion(boxes, frame.shape)
-
-        # 🧠 Risk
-        risk_status = analyze_risk(count, future_count, congestion_level)
-
-        all_counts.append(count)
-        all_status.append(risk_status)
-
-        # 🎨 DRAWING SECTION
-
-        draw_boxes(frame, boxes)
-        frame = draw_heatmap(frame, boxes)
-        draw_ids(frame, display_centers)
-        frame = draw_flow(frame, tracker)
-
-        draw_text(frame, count, future_count, risk_status)
-
-        # 🔥 TITLE
-        cv2.putText(frame, "AI CROWD INTELLIGENCE SYSTEM",
-                    (120, 20),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6,
-                    (255, 255, 255),
-                    2)
-
-        # 🔥 BORDER
-        cv2.rectangle(frame, (0, 0),
-                      (frame.shape[1], frame.shape[0]),
-                      (0, 255, 255), 2)
-
-        # 🔥 FLOW DIRECTION ANALYSIS
-        flow = calculate_flow(tracker)
-        frame = draw_global_flow_indicator(frame, flow)
-
-        # Dynamic hotspot popup appears at the densest crowd area in the frame.
-        show_hotspot_popup = risk_status in ("HIGH", "CRITICAL")
-        frame = draw_high_crowd_popup(frame, boxes, show_hotspot_popup)
-
-        # ⚡ FPS
-        curr_time = time.time()
-        fps = 1 / (curr_time - prev_time) if prev_time != 0 else 0
-        prev_time = curr_time
-
-        cv2.putText(frame, f"FPS: {int(fps)}",
-                    (20, 200),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7,
-                    (255, 255, 0),
-                    2)
-
-        cv2.imshow("Crowd Intelligence System", frame)
-
-        new_ids = _update_unique_gallery(frame, objects, unique_gallery)
-        if new_ids:
-            preview_sequence.extend(new_ids)
-
-        if frame_count % 20 == 0 and preview_sequence:
-            max_page = max(0, (len(preview_sequence) - 1) // 4)
-            preview_page = min(preview_page + 1, max_page)
-
-        preview_frame = _build_preview_frame(frame, unique_gallery, preview_sequence, preview_page)
-        cv2.imshow(PREVIEW_WINDOW_NAME, preview_frame)
-
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
+            f.write("- No alert transitions (NO -> YES) occurred in this run.\n")
 
     # 📊 FINAL ANALYSIS
     if len(all_counts) > 0:

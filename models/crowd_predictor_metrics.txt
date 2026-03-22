@@ -1,0 +1,5 @@
+samples: 95
+train_samples: 76
+val_samples: 19
+mae: 2.857
+mape_percent: 21.291

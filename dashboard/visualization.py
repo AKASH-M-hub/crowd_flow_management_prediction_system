@@ -186,3 +186,48 @@ def draw_high_crowd_popup(frame, boxes, show_popup):
     cv2.putText(frame, "HIGH CROWD ZONE", (x1, label_y), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 0, 255), 2)
 
     return frame
+
+
+def draw_future_prediction_popup(frame, snapshot, elapsed_percent, prediction_active):
+    # Persistent panel: always visible to avoid disappearing state.
+
+    h, w = frame.shape[:2]
+    box_w = 430
+    box_h = 214
+    x1 = max(0, w - box_w - 16)
+    y1 = 90
+    x2 = x1 + box_w
+    y2 = y1 + box_h
+
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 0, 255), -1)
+    cv2.addWeighted(overlay, 0.25, frame, 0.75, 0, frame)
+    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 255), 2)
+
+    incoming_label = "YES" if snapshot.incoming else "NO"
+    incoming_color = (0, 255, 255) if snapshot.incoming else (200, 200, 200)
+    state_label = "ACTIVE" if prediction_active and snapshot.nn_ready else "WARMUP"
+    gate_label = "PASS" if snapshot.incoming_raw else "HOLD"
+
+    cv2.putText(frame, "FUTURE CROWD PREDICTION", (x1 + 14, y1 + 28),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255, 255, 255), 2)
+    cv2.putText(frame, f"Current: {snapshot.current_count}  Future: {snapshot.future_count}  Delta: {snapshot.delta:+d}", (x1 + 14, y1 + 56),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.68, (0, 255, 255), 2)
+    cv2.putText(frame, f"Upcoming Crowd: {incoming_label}   Gate: {gate_label}", (x1 + 14, y1 + 82),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.58, incoming_color, 2)
+    cv2.putText(frame, f"Confidence: {snapshot.confidence_percent:.1f}%  Trend: {snapshot.risk_hint}", (x1 + 14, y1 + 106),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 255, 255), 1)
+    cv2.putText(frame, f"Incoming Probability: {snapshot.incoming_probability_percent:.1f}%", (x1 + 14, y1 + 128),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 255, 255), 1)
+    cv2.putText(frame, f"Mode: {snapshot.prediction_mode}  State: {state_label}", (x1 + 14, y1 + 146),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.50, (255, 255, 255), 1)
+    cv2.putText(frame, f"Threshold: {snapshot.incoming_threshold}  Streak: {snapshot.incoming_streak}  Score: {snapshot.alert_score:.3f}", (x1 + 14, y1 + 164),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.46, (255, 255, 255), 1)
+    cv2.putText(frame, f"Gate Reason: {snapshot.gate_reason}", (x1 + 14, y1 + 180),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.46, (255, 255, 255), 1)
+    cv2.putText(frame, f"Recommended Action: {snapshot.action_recommendation}", (x1 + 14, y1 + 196),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 255, 255), 1)
+    cv2.putText(frame, f"Started at {elapsed_percent:.1f}% video progress", (x1 + 14, y1 + 212),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 255, 255), 1)
+
+    return frame

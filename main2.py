@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import textwrap
 import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
@@ -28,17 +29,24 @@ from processing.prediction_engine import PredictionSnapshot, build_prediction_sn
 from processing.risk_analysis import analyze_risk
 from processing.tracker import SimpleTracker
 
-WINDOW_NAME = "Crowd Timeline Predictor"
+WINDOW_NAME = "Crowd Present and Future Predictor"
+PREVIEW_WINDOW_NAME = "Main2 Person ID Preview"
+PREVIEW_SIZE = (360, 300)
 BUTTON_BAR_HEIGHT = 120
 DISPLAY_WIDTH = 1366
 DISPLAY_HEIGHT = 768
-DETECTION_INTERVAL = 2
-ZOOM_PASS_INTERVAL = 2
+DETECTION_INTERVAL = 3
+ZOOM_PASS_INTERVAL = 3
+FAST_STEP_SIZE = 2
+RESULTS_DIR = "results"
 PREDICTION_METRICS_PATH = "models/crowd_predictor_metrics.txt"
-PREDICTION_CSV_PATH = "prediction_output_log_main2.csv"
-PREDICTION_JSONL_PATH = "prediction_output_log_main2.jsonl"
-PREDICTION_EXPLAIN_PATH = "prediction_recommendations_main2.md"
-PREDICTION_START_PERCENT = 0.0
+PREDICTION_CSV_PATH = os.path.join(RESULTS_DIR, "prediction_output_log_main2.csv")
+PREDICTION_JSONL_PATH = os.path.join(RESULTS_DIR, "prediction_output_log_main2.jsonl")
+PREDICTION_EXPLAIN_PATH = os.path.join(RESULTS_DIR, "prediction_recommendations_main2.md")
+PREDICTION_RESULT_TXT_LATEST = os.path.join(RESULTS_DIR, "prediction_result_main2_latest.txt")
+PREDICTION_RESULT_TXT_DIR = RESULTS_DIR
+PREDICTION_START_PERCENT = 10.0
+FUTURE_LOOKAHEAD_SECONDS = 20.0
 ALERT_MIN_CONFIDENCE_PERCENT = 60.0
 ALERT_MIN_STREAK = 3
 HIGH_CROWD_ON_COUNT = 18
@@ -73,6 +81,26 @@ class Button:
 
     def contains(self, x: int, y: int) -> bool:
         return self.x1 <= x <= self.x2 and self.y1 <= y <= self.y2
+
+
+@dataclass
+class ForecastSimulation:
+    target_percent: int
+    target_frame: int
+    current_count: int
+    predicted_count: int
+    delta: int
+    confidence_percent: float
+    incoming_probability_percent: float
+    risk_hint: str
+    gate_reason: str
+    action_recommendation: str
+    prediction_mode: str
+    incoming: bool
+    incoming_threshold: int
+    future_risk_status: str
+    checkpoints: List[Tuple[int, int]]
+    model_ready: bool
 
 
 def _update_tracker_compat(tracker, boxes, frame):
@@ -155,12 +183,19 @@ def _compute_action_attribute_features(
 class TimelineCrowdAnalyzer:
     def __init__(self, video_path: str) -> None:
         self.video_path = video_path
+        os.makedirs(RESULTS_DIR, exist_ok=True)
+        cv2.setUseOptimized(True)
+        cv2.setNumThreads(max(1, min(8, os.cpu_count() or 4)))
         self.cap = cv2.VideoCapture(video_path)
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
         if not self.cap.isOpened():
             raise RuntimeError(f"Could not open video: {video_path}")
 
         self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
         self.fps = float(self.cap.get(cv2.CAP_PROP_FPS) or 0.0)
+        if self.fps <= 0:
+            self.fps = 25.0
+        self.frame_budget_sec = 1.0 / max(1.0, self.fps)
         if self.total_frames <= 0:
             raise RuntimeError("Video has no frames.")
 
@@ -182,7 +217,10 @@ class TimelineCrowdAnalyzer:
         _set_tracker_mode_compat(self.tracker, self.tracker_mode)
 
         self.count_history: List[int] = []
+        self.current_nowcast_history: List[int] = []
+        self.future_count_history: List[int] = []
         self.density_history: List[float] = []
+        self.future_risk_history: List[str] = []
         self.action_history: List[List[float]] = []
         self.attribute_history: List[List[float]] = []
         self.incoming_streak = 0
@@ -191,6 +229,11 @@ class TimelineCrowdAnalyzer:
         self.last_boxes: List[List[int]] = []
         self.last_objects: List[List[int]] = []
         self.detection_step = 0
+        self._last_frame_idx = -1
+        self._last_frame_image: Optional[np.ndarray] = None
+        self.unique_gallery: Dict[int, Dict[str, np.ndarray]] = {}
+        self.preview_sequence: List[int] = []
+        self.preview_page = 0
 
         self.cache: Dict[int, FrameAnalysis] = {}
         self.last_analyzed_frame = -1
@@ -200,6 +243,8 @@ class TimelineCrowdAnalyzer:
         self.overlay_enabled = True
         self.auto_predict_enabled = True
         self.last_predict_message = "Move timeline and click Predict"
+        self.studio_forecast: Optional[ForecastSimulation] = None
+        self.studio_candidate_forecast: Optional[ForecastSimulation] = None
 
         self._ignore_trackbar_callback = False
         self.buttons = self._build_buttons()
@@ -209,22 +254,476 @@ class TimelineCrowdAnalyzer:
         self.prediction_events: List[FrameAnalysis] = []
         self.prediction_log = open(PREDICTION_CSV_PATH, "w", encoding="utf-8")
         self.prediction_jsonl = open(PREDICTION_JSONL_PATH, "w", encoding="utf-8")
+        self.latest_result_txt_path = PREDICTION_RESULT_TXT_LATEST
         self.prediction_log.write(
-            "frame,elapsed_percent,current_count,future_count,delta,confidence_percent,incoming_probability_percent,"
+            "frame,elapsed_percent,current_count,current_nowcast,future_count,delta,confidence_percent,incoming_probability_percent,"
             "incoming,risk_status,congestion,flow_label,recommendation,gate_reason,action_recommendation,prediction_mode\n"
         )
 
     def _build_buttons(self) -> List[Button]:
-        y1 = DISPLAY_HEIGHT + 18
-        y2 = DISPLAY_HEIGHT + BUTTON_BAR_HEIGHT - 20
-        return [
-            Button("run", 20, y1, 160, y2),
-            Button("stop", 180, y1, 320, y2),
-            Button("predict", 340, y1, 520, y2),
-            Button("overlay", 540, y1, 760, y2),
-            Button("auto", 780, y1, 1000, y2),
-            Button("reset", 1020, y1, 1200, y2),
-        ]
+        y1 = DISPLAY_HEIGHT + 24
+        y2 = DISPLAY_HEIGHT + BUTTON_BAR_HEIGHT - 14
+        left = 20
+        gap = 12
+        button_widths = {
+            "run": 150,
+            "stop": 150,
+            "predict": 180,
+            "overlay": 180,
+            "auto": 190,
+            "reset": 190,
+        }
+        buttons: List[Button] = []
+        order = ["run", "stop", "predict", "overlay", "auto", "reset"]
+        x = left
+        for key in order:
+            width = button_widths[key]
+            buttons.append(Button(key, x, y1, x + width, y2))
+            x += width + gap
+        return buttons
+
+    def _draw_timeline_progress(self, canvas: np.ndarray, analysis: FrameAnalysis) -> None:
+        bar_x1 = 20
+        bar_y1 = DISPLAY_HEIGHT + 4
+        bar_x2 = DISPLAY_WIDTH - 20
+        bar_y2 = DISPLAY_HEIGHT + 14
+
+        cv2.rectangle(canvas, (bar_x1, bar_y1), (bar_x2, bar_y2), (48, 48, 48), -1)
+        cv2.rectangle(canvas, (bar_x1, bar_y1), (bar_x2, bar_y2), (80, 80, 80), 1)
+
+        full_w = max(1, bar_x2 - bar_x1)
+        analyzed_ratio = (self.last_analyzed_frame / max(1, self.total_frames - 1))
+        cursor_ratio = analysis.frame_idx / max(1, self.total_frames - 1)
+
+        analyzed_w = int(full_w * max(0.0, min(1.0, analyzed_ratio)))
+        cursor_x = bar_x1 + int(full_w * max(0.0, min(1.0, cursor_ratio)))
+        if analyzed_w > 0:
+            cv2.rectangle(canvas, (bar_x1, bar_y1), (bar_x1 + analyzed_w, bar_y2), (23, 103, 163), -1)
+        cv2.line(canvas, (cursor_x, bar_y1 - 2), (cursor_x, bar_y2 + 2), (0, 220, 255), 2)
+
+        frame_sec = self._seconds_from_frame(analysis.frame_idx)
+        total_sec = self._seconds_from_frame(self.total_frames - 1)
+        cv2.putText(
+            canvas,
+            f"Timeline: {self._format_time(frame_sec)} / {self._format_time(total_sec)}  |  Frame {analysis.frame_idx + 1}/{self.total_frames}",
+            (20, DISPLAY_HEIGHT + BUTTON_BAR_HEIGHT - 4),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.46,
+            (230, 230, 230),
+            1,
+        )
+
+    def _button_palette(self, key: str, active: bool) -> Tuple[Tuple[int, int, int], Tuple[int, int, int]]:
+        active_fill = {
+            "run": (28, 181, 103),
+            "stop": (38, 38, 220),
+            "predict": (14, 118, 248),
+            "overlay": (0, 155, 185),
+            "auto": (130, 92, 230),
+            "reset": (0, 165, 255),
+        }
+        if active:
+            return active_fill.get(key, (0, 180, 255)), (12, 12, 12)
+        return (35, 35, 35), (245, 245, 245)
+
+    def _safe_short(self, text: str, max_chars: int) -> str:
+        cleaned = " ".join((text or "").strip().split())
+        if len(cleaned) <= max_chars:
+            return cleaned
+        return cleaned[: max(0, max_chars - 3)] + "..."
+
+    def _get_frame_for_render(self, frame_idx: int) -> np.ndarray:
+        if self._last_frame_idx == frame_idx and self._last_frame_image is not None:
+            return self._last_frame_image.copy()
+        return self._read_frame(frame_idx)
+
+    def _surge_decision(self, gate_reason: str, incoming_probability_percent: float, incoming: bool) -> Tuple[str, str]:
+        if gate_reason == "PASS" and (incoming or incoming_probability_percent >= 60.0):
+            return "YES", "Gate pass with strong incoming probability"
+        if gate_reason == "PASS" and incoming_probability_percent >= 50.0:
+            return "YES", "Gate pass with moderate incoming probability"
+        if gate_reason == "DELTA_BELOW_THRESHOLD":
+            return "NO", "Predicted increase below alert threshold"
+        if gate_reason == "CONFIDENCE_TOO_LOW":
+            return "NO", "Confidence below minimum threshold"
+        if gate_reason == "STREAK_NOT_MET":
+            return "NO", "Trend streak not strong enough yet"
+        return "NO", "Model gate did not pass surge criteria"
+
+    def _update_unique_gallery(self, frame: np.ndarray) -> None:
+        new_ids: List[int] = []
+        for x1, y1, x2, y2, person_id in self.last_objects:
+            x1 = max(0, min(frame.shape[1] - 1, x1))
+            y1 = max(0, min(frame.shape[0] - 1, y1))
+            x2 = max(0, min(frame.shape[1], x2))
+            y2 = max(0, min(frame.shape[0], y2))
+            if x2 <= x1 or y2 <= y1:
+                continue
+
+            crop = frame[y1:y2, x1:x2]
+            if crop.size == 0:
+                continue
+
+            pid = int(person_id)
+            area = int((x2 - x1) * (y2 - y1))
+            existing = self.unique_gallery.get(pid)
+            if existing is None:
+                self.unique_gallery[pid] = {"image": crop.copy(), "area": area}
+                new_ids.append(pid)
+            elif area > int(existing.get("area", 0)):
+                self.unique_gallery[pid] = {"image": crop.copy(), "area": area}
+
+        if new_ids:
+            self.preview_sequence.extend(new_ids)
+
+        if self.preview_sequence and len(self.preview_sequence) > 4:
+            total_pages = max(1, (len(self.preview_sequence) + 3) // 4)
+            self.preview_page = (self.preview_page + 1) % total_pages
+
+    def _build_preview_frame(self) -> np.ndarray:
+        preview_w, preview_h = PREVIEW_SIZE
+        canvas = np.zeros((preview_h, preview_w, 3), dtype=np.uint8)
+        canvas[:] = (20, 20, 20)
+        cv2.rectangle(canvas, (0, 0), (preview_w - 1, preview_h - 1), (0, 255, 255), 2)
+        cv2.putText(canvas, f"Unique IDs: {len(self.unique_gallery)}", (12, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (255, 255, 255), 2)
+
+        if not self.preview_sequence:
+            cv2.putText(canvas, "No tracked IDs yet", (82, 164), cv2.FONT_HERSHEY_SIMPLEX, 0.56, (240, 240, 240), 1)
+            return canvas
+
+        cards_per_page = 4
+        total_pages = max(1, (len(self.preview_sequence) + cards_per_page - 1) // cards_per_page)
+        self.preview_page = min(self.preview_page, total_pages - 1)
+
+        start = self.preview_page * cards_per_page
+        page_ids = self.preview_sequence[start:start + cards_per_page]
+
+        card_w, card_h = 160, 116
+        x_positions = [10, 190]
+        y_positions = [40, 164]
+
+        for idx, pid in enumerate(page_ids):
+            row = idx // 2
+            col = idx % 2
+            x = x_positions[col]
+            y = y_positions[row]
+            card = np.full((card_h, card_w, 3), 30, dtype=np.uint8)
+
+            entry = self.unique_gallery.get(pid)
+            if entry is not None:
+                image = entry["image"]
+                avail_w = card_w - 10
+                avail_h = card_h - 28
+                scale = min(avail_w / max(1, image.shape[1]), avail_h / max(1, image.shape[0]))
+                rw = max(1, int(image.shape[1] * scale))
+                rh = max(1, int(image.shape[0] * scale))
+                resized = cv2.resize(image, (rw, rh), interpolation=cv2.INTER_LINEAR)
+                ox = (card_w - rw) // 2
+                oy = 4 + (avail_h - rh) // 2
+                card[oy:oy + rh, ox:ox + rw] = resized
+
+            cv2.rectangle(card, (0, 0), (card_w - 1, card_h - 1), (0, 255, 255), 1)
+            cv2.rectangle(card, (0, card_h - 24), (card_w - 1, card_h - 1), (40, 40, 40), -1)
+            cv2.putText(card, f"ID: {pid}", (8, card_h - 7), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 255, 255), 1)
+            canvas[y:y + card_h, x:x + card_w] = card
+
+        cv2.putText(canvas, f"Page {self.preview_page + 1}/{total_pages}", (230, preview_h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (230, 230, 230), 1)
+        return canvas
+
+    def _confidence_band(self, confidence_percent: float) -> Tuple[str, Tuple[int, int, int]]:
+        if confidence_percent >= 75.0:
+            return "HIGH", (120, 255, 170)
+        if confidence_percent >= 60.0:
+            return "MEDIUM", (0, 220, 255)
+        return "LOW", (0, 165, 255)
+
+    def _predict_current_nowcast(self) -> int:
+        if not self.count_history:
+            return 0
+        window = self.count_history[-12:]
+        if len(window) < 3:
+            return int(window[-1])
+        values = np.array(window, dtype=np.float32)
+        weights = np.linspace(0.6, 1.4, num=len(values), dtype=np.float32)
+        baseline = float(np.average(values, weights=weights))
+        velocity = float(values[-1] - values[max(0, len(values) - 4)])
+        nowcast = baseline + (0.18 * velocity)
+        return max(0, int(round(nowcast)))
+
+    def _future_horizon_frames(self) -> int:
+        return max(1, int(round(self.fps * FUTURE_LOOKAHEAD_SECONDS)))
+
+    def _predict_future_seconds_ahead(
+        self,
+        elapsed_ratio: float,
+        action_features: List[float],
+        attribute_features: List[float],
+        fallback_count: int,
+    ) -> int:
+        if not (self.predictor.is_trained() and self.count_history and self.density_history):
+            return int(fallback_count)
+
+        horizon_frames = self._future_horizon_frames()
+        simulated_counts = list(self.count_history)
+        simulated_densities = list(self.density_history)
+        fallback_density = float(simulated_densities[-1])
+        frame_ratio_step = 1.0 / max(1.0, float(self.total_frames - 1))
+
+        for step in range(horizon_frames):
+            next_elapsed_ratio = min(1.0, float(elapsed_ratio) + ((step + 1) * frame_ratio_step))
+            next_count = self.predictor.predict(
+                simulated_counts,
+                simulated_densities,
+                next_elapsed_ratio,
+                action_features=action_features,
+                attribute_features=attribute_features,
+            )
+            simulated_counts.append(max(0, int(next_count)))
+            simulated_densities.append(fallback_density)
+
+        return int(simulated_counts[-1]) if simulated_counts else int(fallback_count)
+
+    def _format_future_horizon(self, from_frame: int, to_frame: int) -> str:
+        delta_frames = max(0, int(to_frame) - int(from_frame))
+        sec = delta_frames / max(1.0, self.fps)
+        return f"{delta_frames} frames (~{sec:.2f}s)"
+
+    def _simulate_forecast_to_percent(self, analysis: FrameAnalysis, target_percent: int) -> ForecastSimulation:
+        target_percent = int(max(11, min(100, target_percent)))
+        target_frame = int(round((target_percent / 100.0) * max(1, self.total_frames - 1)))
+        target_frame = max(analysis.frame_idx, min(self.total_frames - 1, target_frame))
+
+        model_ready = bool(
+            self.predictor.is_trained()
+            and len(self.count_history) >= self.predictor.window_size
+            and len(self.density_history) >= self.predictor.window_size
+        )
+
+        simulated_counts = list(self.count_history)
+        simulated_densities = list(self.density_history)
+        simulated_actions = list(self.action_history)
+        simulated_attributes = list(self.attribute_history)
+
+        fallback_density = simulated_densities[-1] if simulated_densities else float(analysis.density_ratio)
+        fallback_action = simulated_actions[-1] if simulated_actions else [0.0, 0.0, 0.0, 0.0]
+        fallback_attribute = simulated_attributes[-1] if simulated_attributes else [0.0, 0.0, 0.0, 0.0]
+
+        current_sim_frame = analysis.frame_idx
+        while current_sim_frame < target_frame:
+            next_elapsed_ratio = (current_sim_frame + 1) / max(1, self.total_frames - 1)
+
+            if model_ready:
+                nn_pred = self.predictor.predict(
+                    simulated_counts,
+                    simulated_densities,
+                    next_elapsed_ratio,
+                    action_features=fallback_action,
+                    attribute_features=fallback_attribute,
+                )
+                next_count = max(0, int(nn_pred))
+            else:
+                next_count = int(simulated_counts[-1] if simulated_counts else analysis.count)
+
+            simulated_counts.append(next_count)
+            simulated_densities.append(float(fallback_density))
+            simulated_actions.append(list(fallback_action))
+            simulated_attributes.append(list(fallback_attribute))
+            current_sim_frame += 1
+
+        predicted_count = int(simulated_counts[target_frame]) if target_frame < len(simulated_counts) else int(analysis.count)
+
+        snapshot = build_prediction_snapshot(
+            current_count=int(analysis.count),
+            nn_pred=predicted_count,
+            count_history=simulated_counts[: target_frame + 1],
+            metrics=self.prediction_metrics,
+            prediction_active=analysis.elapsed_percent >= PREDICTION_START_PERCENT,
+            nn_ready=model_ready,
+            incoming_streak=self.incoming_streak,
+            min_confidence_percent=ALERT_MIN_CONFIDENCE_PERCENT,
+            min_streak=ALERT_MIN_STREAK,
+        )
+
+        percent_marks = [0.0, 0.25, 0.50, 0.75, 1.0]
+        checkpoints: List[Tuple[int, int]] = []
+        start_frame = analysis.frame_idx
+        span = max(1, target_frame - start_frame)
+        for mark in percent_marks:
+            frame = start_frame + int(round(span * mark))
+            frame = max(start_frame, min(target_frame, frame))
+            value = int(simulated_counts[frame]) if frame < len(simulated_counts) else predicted_count
+            checkpoints.append((frame, value))
+
+        return ForecastSimulation(
+            target_percent=target_percent,
+            target_frame=target_frame,
+            current_count=int(analysis.count),
+            predicted_count=int(predicted_count),
+            delta=int(predicted_count - int(analysis.count)),
+            confidence_percent=float(snapshot.confidence_percent),
+            incoming_probability_percent=float(snapshot.incoming_probability_percent),
+            risk_hint=str(snapshot.risk_hint),
+            gate_reason=str(snapshot.gate_reason),
+            action_recommendation=str(snapshot.action_recommendation),
+            prediction_mode=str(snapshot.prediction_mode),
+            incoming=bool(snapshot.incoming),
+            incoming_threshold=int(snapshot.incoming_threshold),
+            future_risk_status=analyze_risk(int(analysis.count), int(predicted_count), float(analysis.congestion_level)),
+            checkpoints=checkpoints,
+            model_ready=model_ready,
+        )
+
+    def _open_prediction_timeline_window(self, analysis: FrameAnalysis) -> None:
+        window = "Prediction Timeline Studio"
+        slider_name = "Future %"
+        if analysis.elapsed_percent < PREDICTION_START_PERCENT:
+            self.last_predict_message = (
+                f"Prediction starts after {PREDICTION_START_PERCENT:.0f}% analysis. "
+                f"Current progress is {analysis.elapsed_percent:.1f}%."
+            )
+            self.render(force_predict=False)
+            return
+
+        initial = int(max(11, min(100, round(max(analysis.elapsed_percent + 1.0, 11.0)))))
+        selected_percent = initial
+        applied_message: Optional[str] = None
+        begin_requested = False
+        panel_h, panel_w = 600, 1080
+        begin_btn = (690, 516, 1030, 570)
+
+        def _on_change(val: int) -> None:
+            nonlocal selected_percent
+            selected_percent = max(11, min(100, int(val)))
+
+        def _on_mouse(event: int, x: int, y: int, _flags: int, _param: object) -> None:
+            nonlocal begin_requested
+            if event != cv2.EVENT_LBUTTONDOWN:
+                return
+            x1, y1, x2, y2 = begin_btn
+            if x1 <= x <= x2 and y1 <= y <= y2:
+                begin_requested = True
+
+        cv2.namedWindow(window, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(window, panel_w, panel_h)
+        cv2.setMouseCallback(window, _on_mouse)
+        cv2.createTrackbar(slider_name, window, initial, 100, _on_change)
+
+        try:
+            while True:
+                simulation = self._simulate_forecast_to_percent(analysis, selected_percent)
+                current_nowcast = self._predict_current_nowcast()
+                horizon_text = self._format_future_horizon(analysis.frame_idx, simulation.target_frame)
+                future_seconds = max(0.0, (simulation.target_frame - analysis.frame_idx) / max(1.0, self.fps))
+                self.studio_candidate_forecast = simulation
+                surge_label, surge_reason = self._surge_decision(
+                    simulation.gate_reason,
+                    simulation.incoming_probability_percent,
+                    simulation.incoming,
+                )
+                confidence_band, confidence_color = self._confidence_band(simulation.confidence_percent)
+
+                panel = np.zeros((panel_h, panel_w, 3), dtype=np.uint8)
+                panel[:] = (18, 22, 30)
+
+                cv2.putText(panel, "PREDICTION TIMELINE STUDIO", (24, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.90, (0, 220, 255), 2)
+                cv2.putText(
+                    panel,
+                    "Model output uses trained crowd predictor + observed current-video history. No synthetic metadata is injected.",
+                    (24, 68),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.48,
+                    (235, 235, 235),
+                    1,
+                )
+                cv2.line(panel, (24, 84), (1056, 84), (70, 70, 70), 1)
+
+                bar_x1, bar_y1, bar_x2, bar_y2 = 36, 124, 1044, 152
+                cv2.rectangle(panel, (bar_x1, bar_y1), (bar_x2, bar_y2), (50, 50, 50), -1)
+                cv2.rectangle(panel, (bar_x1, bar_y1), (bar_x2, bar_y2), (100, 100, 100), 1)
+                width = bar_x2 - bar_x1
+                current_x = bar_x1 + int(width * (max(0.0, min(1.0, analysis.elapsed_percent / 100.0))))
+                target_x = bar_x1 + int(width * (simulation.target_percent / 100.0))
+                cv2.rectangle(panel, (bar_x1, bar_y1), (current_x, bar_y2), (20, 115, 180), -1)
+                cv2.rectangle(panel, (current_x, bar_y1), (target_x, bar_y2), (70, 145, 70), -1)
+                cv2.line(panel, (target_x, bar_y1 - 6), (target_x, bar_y2 + 6), (0, 220, 255), 2)
+
+                cv2.putText(panel, f"Current timeline: {analysis.elapsed_percent:.1f}%", (36, 108), cv2.FONT_HERSHEY_SIMPLEX, 0.56, (255, 255, 255), 1)
+                cv2.putText(panel, f"Target timeline: {simulation.target_percent}%  (frame {simulation.target_frame + 1}/{self.total_frames})", (565, 108), cv2.FONT_HERSHEY_SIMPLEX, 0.56, (255, 255, 255), 1)
+                cv2.putText(panel, f"Future horizon: {horizon_text}", (36, 174), cv2.FONT_HERSHEY_SIMPLEX, 0.54, (225, 225, 225), 1)
+                cv2.putText(panel, f"Predicting next: {future_seconds:.2f} seconds", (565, 174), cv2.FONT_HERSHEY_SIMPLEX, 0.54, (225, 225, 225), 1)
+
+                cv2.putText(panel, f"Now Crowd: {analysis.count}", (40, 236), cv2.FONT_HERSHEY_SIMPLEX, 0.84, (250, 250, 250), 2)
+                cv2.putText(panel, f"Current Nowcast: {current_nowcast}", (420, 236), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (235, 235, 235), 2)
+
+                if begin_requested:
+                    cv2.putText(panel, f"Predicted Crowd: {simulation.predicted_count}", (40, 282), cv2.FONT_HERSHEY_SIMPLEX, 0.86, (0, 255, 255), 2)
+                    cv2.putText(panel, f"Delta: {simulation.delta:+d}", (40, 322), cv2.FONT_HERSHEY_SIMPLEX, 0.80, (110, 255, 140), 2)
+                    cv2.putText(panel, f"Confidence: {simulation.confidence_percent:.1f}% ({confidence_band})", (420, 282), cv2.FONT_HERSHEY_SIMPLEX, 0.70, confidence_color, 2)
+                    cv2.putText(panel, f"Incoming Prob: {simulation.incoming_probability_percent:.1f}%", (420, 312), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (220, 220, 220), 1)
+                    cv2.putText(panel, f"Future Crowd Surge: {surge_label}", (420, 338), cv2.FONT_HERSHEY_SIMPLEX, 0.66, (120, 255, 170) if surge_label == "YES" else (210, 210, 210), 2)
+                    cv2.putText(panel, f"Future Risk: {simulation.future_risk_status}", (420, 364), cv2.FONT_HERSHEY_SIMPLEX, 0.56, (220, 220, 220), 1)
+                    cv2.putText(panel, "Press Enter to apply this prediction to main screen", (420, 396), cv2.FONT_HERSHEY_SIMPLEX, 0.56, (220, 220, 220), 1)
+                else:
+                    cv2.putText(panel, "Predicted Crowd: waiting for begin", (40, 282), cv2.FONT_HERSHEY_SIMPLEX, 0.80, (205, 205, 205), 2)
+                    cv2.putText(panel, "Delta: --", (40, 322), cv2.FONT_HERSHEY_SIMPLEX, 0.76, (185, 185, 185), 2)
+                    cv2.putText(panel, "Click Begin Prediction to generate result", (420, 302), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (220, 220, 220), 1)
+
+                cp_text = " | ".join([f"{int((frame / max(1, self.total_frames - 1)) * 100)}%:{count}" for frame, count in simulation.checkpoints])
+                cv2.putText(panel, self._safe_short(f"Simulation checkpoints -> {cp_text}", 146), (40, 444), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (200, 200, 200), 1)
+
+                gate_ok = "MET" if simulation.gate_reason == "PASS" else "NOT_MET"
+                threshold_ok = "MET" if simulation.delta >= simulation.incoming_threshold else "NOT_MET"
+                cv2.putText(panel, "How prediction computed", (40, 478), cv2.FONT_HERSHEY_SIMPLEX, 0.60, (0, 220, 255), 2)
+                cv2.putText(
+                    panel,
+                    f"Window={self.predictor.window_size} Horizon={self.predictor.horizon_steps} | AnalyzedFrames={len(self.count_history)} | ModelReady={int(simulation.model_ready)}",
+                    (40, 504),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.48,
+                    (220, 220, 220),
+                    1,
+                )
+                cv2.putText(
+                    panel,
+                    f"Gate={simulation.gate_reason} ({gate_ok}) | Threshold={simulation.incoming_threshold} ({threshold_ok}) | PredictionMode={simulation.prediction_mode}",
+                    (40, 528),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.48,
+                    (220, 220, 220),
+                    1,
+                )
+
+                btn_color = (26, 164, 98) if not begin_requested else (12, 132, 80)
+                x1, y1, x2, y2 = begin_btn
+                cv2.rectangle(panel, (x1, y1), (x2, y2), btn_color, -1)
+                cv2.rectangle(panel, (x1, y1), (x2, y2), (230, 230, 230), 2)
+                cv2.putText(panel, "BEGIN PREDICTION", (x1 + 38, y1 + 34), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (10, 10, 10), 2)
+                cv2.putText(panel, "Esc/Q: Close", (40, 420), cv2.FONT_HERSHEY_SIMPLEX, 0.56, (210, 210, 210), 1)
+
+                cv2.imshow(window, panel)
+                key = cv2.waitKey(35) & 0xFF
+                if key in (27, ord("q")):
+                    break
+                if key in (13, ord("p")) and begin_requested:
+                    self.studio_forecast = simulation
+                    self.running = False
+                    self.current_frame_idx = int(simulation.target_frame)
+                    surge_label, _ = self._surge_decision(
+                        simulation.gate_reason,
+                        simulation.incoming_probability_percent,
+                        simulation.incoming,
+                    )
+                    applied_message = (
+                        f"Applied studio forecast @ {simulation.target_percent}% (frame {simulation.target_frame + 1}): "
+                        f"now {analysis.count} -> future {simulation.predicted_count} (confidence {simulation.confidence_percent:.1f}%, risk {simulation.future_risk_status}, surge {surge_label})"
+                    )
+                    break
+        finally:
+            cv2.destroyWindow(window)
+
+        if applied_message:
+            self.last_predict_message = applied_message
+            self.render(force_predict=False)
 
     def _button_label(self, key: str) -> str:
         if key == "run":
@@ -232,13 +731,13 @@ class TimelineCrowdAnalyzer:
         if key == "stop":
             return "Stop"
         if key == "predict":
-            return "Predict"
+            return "Predict +20s"
         if key == "overlay":
             return f"Overlay: {'ON' if self.overlay_enabled else 'OFF'}"
         if key == "auto":
             return f"AutoPredict: {'ON' if self.auto_predict_enabled else 'OFF'}"
         if key == "reset":
-            return "Reset Timeline"
+            return "Reboot Timeline"
         return key
 
     def _flow_label(self, flow_vectors: List[Tuple[float, float]]) -> str:
@@ -293,12 +792,18 @@ class TimelineCrowdAnalyzer:
         ok, frame = self.cap.read()
         if not ok or frame is None:
             raise RuntimeError(f"Could not read frame {frame_idx}.")
-        return cv2.resize(frame, (DISPLAY_WIDTH, DISPLAY_HEIGHT))
+        resized = cv2.resize(frame, (DISPLAY_WIDTH, DISPLAY_HEIGHT), interpolation=cv2.INTER_LINEAR)
+        self._last_frame_idx = frame_idx
+        self._last_frame_image = resized.copy()
+        return resized
 
     def _reset_analysis_state(self) -> None:
         self.cache.clear()
         self.count_history.clear()
+        self.current_nowcast_history.clear()
+        self.future_count_history.clear()
         self.density_history.clear()
+        self.future_risk_history.clear()
         self.action_history.clear()
         self.attribute_history.clear()
         self.incoming_streak = 0
@@ -308,6 +813,11 @@ class TimelineCrowdAnalyzer:
         self.last_analyzed_frame = -1
         self.detection_step = 0
         self.smooth_detect_count = 0.0
+        self._last_frame_idx = -1
+        self._last_frame_image = None
+        self.unique_gallery.clear()
+        self.preview_sequence.clear()
+        self.preview_page = 0
         self.tracker_mode = "low"
         try:
             self.tracker = HybridTracker()
@@ -316,12 +826,15 @@ class TimelineCrowdAnalyzer:
         _set_tracker_mode_compat(self.tracker, self.tracker_mode)
 
     def _analyze_frame(self, frame_idx: int) -> FrameAnalysis:
-        frame = self._read_frame(frame_idx)
+        frame_shape = (DISPLAY_HEIGHT, DISPLAY_WIDTH, 3)
+        frame_for_detection: Optional[np.ndarray] = None
 
         if frame_idx % DETECTION_INTERVAL == 0:
+            frame_for_detection = self._read_frame(frame_idx)
+            frame_shape = frame_for_detection.shape
             self.detection_step += 1
             use_zoom = (self.detection_step % ZOOM_PASS_INTERVAL == 0)
-            boxes = detect_people(self.model, frame, use_zoom=use_zoom)
+            boxes = detect_people(self.model, frame_for_detection, use_zoom=use_zoom)
 
             raw_detect_count = len(boxes)
             if frame_idx <= DETECTION_INTERVAL:
@@ -339,7 +852,7 @@ class TimelineCrowdAnalyzer:
                 self.tracker_mode = "low"
                 _set_tracker_mode_compat(self.tracker, self.tracker_mode)
 
-            objects = _update_tracker_compat(self.tracker, boxes, frame)
+            objects = _update_tracker_compat(self.tracker, boxes, frame_for_detection)
             self.last_boxes = boxes
             self.last_objects = objects
         else:
@@ -362,7 +875,7 @@ class TimelineCrowdAnalyzer:
             )
         self.count_history.append(int(fused_count))
 
-        frame_area = max(1, frame.shape[0] * frame.shape[1])
+        frame_area = max(1, frame_shape[0] * frame_shape[1])
         box_area_sum = 0
         for x1, y1, x2, y2 in boxes:
             box_area_sum += max(0, x2 - x1) * max(0, y2 - y1)
@@ -373,7 +886,7 @@ class TimelineCrowdAnalyzer:
             objects,
             boxes,
             self.previous_tracked_centers,
-            frame.shape,
+            frame_shape,
         )
         self.action_history.append(action_features)
         self.attribute_history.append(attribute_features)
@@ -387,12 +900,11 @@ class TimelineCrowdAnalyzer:
         nn_ready = prediction_active and self.predictor.is_trained() and len(self.count_history) >= self.predictor.window_size
 
         if nn_ready:
-            nn_pred = self.predictor.predict(
-                self.count_history,
-                self.density_history,
-                elapsed_ratio,
+            nn_pred = self._predict_future_seconds_ahead(
+                elapsed_ratio=elapsed_ratio,
                 action_features=action_features,
                 attribute_features=attribute_features,
+                fallback_count=count,
             )
         else:
             nn_pred = count
@@ -426,9 +938,13 @@ class TimelineCrowdAnalyzer:
             min_streak=ALERT_MIN_STREAK,
         )
         future_count = snapshot.future_count if prediction_active else count
+        current_nowcast = self._predict_current_nowcast()
+        self.current_nowcast_history.append(int(current_nowcast))
 
-        congestion_level = detect_congestion(boxes, frame.shape)
+        congestion_level = detect_congestion(boxes, frame_shape)
         risk_status = analyze_risk(count, future_count, congestion_level)
+        self.future_count_history.append(int(future_count))
+        self.future_risk_history.append(str(risk_status))
         flow_vectors = calculate_flow(self.tracker)
         flow_label = self._flow_label(flow_vectors)
         recommendation, explanation = self._make_recommendation(snapshot, risk_status, congestion_level, flow_label)
@@ -450,7 +966,7 @@ class TimelineCrowdAnalyzer:
         )
 
         self.prediction_log.write(
-            f"{frame_idx},{elapsed_percent:.3f},{snapshot.current_count},{snapshot.future_count},{snapshot.delta},"
+            f"{frame_idx},{elapsed_percent:.3f},{snapshot.current_count},{current_nowcast},{snapshot.future_count},{snapshot.delta},"
             f"{snapshot.confidence_percent:.1f},{snapshot.incoming_probability_percent:.1f},{int(snapshot.incoming)},"
             f"{risk_status},{congestion_level:.3f},{flow_label},{recommendation},{snapshot.gate_reason},"
             f"{snapshot.action_recommendation},{snapshot.prediction_mode}\n"
@@ -461,6 +977,7 @@ class TimelineCrowdAnalyzer:
                     "frame": frame_idx,
                     "elapsed_percent": round(elapsed_percent, 3),
                     "current_count": snapshot.current_count,
+                    "current_nowcast": int(current_nowcast),
                     "future_count": snapshot.future_count,
                     "delta": snapshot.delta,
                     "confidence_percent": snapshot.confidence_percent,
@@ -512,6 +1029,13 @@ class TimelineCrowdAnalyzer:
         return latest
 
     def _draw_buttons(self, canvas: np.ndarray) -> None:
+        analysis = self.cache.get(self.current_frame_idx)
+        if analysis is None:
+            analysis = self.cache.get(self.last_analyzed_frame)
+        if analysis is None:
+            analysis = self.analyze_to(self.current_frame_idx)
+        self._draw_timeline_progress(canvas, analysis)
+
         for button in self.buttons:
             active = False
             if button.key == "run" and self.running:
@@ -523,66 +1047,103 @@ class TimelineCrowdAnalyzer:
             if button.key == "auto" and self.auto_predict_enabled:
                 active = True
 
-            fill = (0, 180, 255) if active else (40, 40, 40)
-            text_col = (20, 20, 20) if active else (255, 255, 255)
+            fill, text_col = self._button_palette(button.key, active)
             cv2.rectangle(canvas, (button.x1, button.y1), (button.x2, button.y2), fill, -1)
-            cv2.rectangle(canvas, (button.x1, button.y1), (button.x2, button.y2), (255, 255, 255), 2)
+            cv2.rectangle(canvas, (button.x1, button.y1), (button.x2, button.y2), (235, 235, 235), 2)
             cv2.putText(
                 canvas,
                 self._button_label(button.key),
-                (button.x1 + 12, button.y1 + 40),
+                (button.x1 + 10, button.y1 + 38),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.68,
+                0.62,
                 text_col,
                 2,
             )
 
         cv2.putText(
             canvas,
-            "Keys: r=Run s=Stop p=Predict o=Overlay a=AutoPredict c=Reset q=Quit",
-            (20, DISPLAY_HEIGHT + BUTTON_BAR_HEIGHT - 8),
+            "Keys: r=Run  s=Stop  p=Predict +20s  o=Overlay  a=AutoPredict  c=Reboot  q=Quit",
+            (20, DISPLAY_HEIGHT + 20),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
+            0.45,
             (220, 220, 220),
             1,
         )
 
     def _overlay_custom_panels(self, frame: np.ndarray, analysis: FrameAnalysis) -> None:
         snap = analysis.snapshot
-        cv2.putText(frame, "CROWD TIMELINE ANALYZER - ADVANCED", (20, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.78, (0, 255, 255), 2)
-        cv2.putText(frame, f"Recommendation: {analysis.recommendation}", (20, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.66, (0, 255, 255), 2)
-        cv2.putText(frame, f"Explain: {analysis.explanation}", (20, 82), cv2.FONT_HERSHEY_SIMPLEX, 0.54, (255, 255, 255), 1)
-        cv2.putText(frame, f"Risk: {analysis.risk_status}  Congestion: {analysis.congestion_level:.1f}", (20, 106), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255, 255, 255), 2)
+        left_x1, left_y1, left_x2, left_y2 = 16, 14, 760, 198
+        right_x1, right_y1, right_x2, right_y2 = 820, 14, DISPLAY_WIDTH - 16, 248
 
-        frame_sec = self._seconds_from_frame(analysis.frame_idx)
-        total_sec = self._seconds_from_frame(self.total_frames - 1)
-        cv2.putText(
-            frame,
-            f"Timeline: {self._format_time(frame_sec)} / {self._format_time(total_sec)} | Frame: {analysis.frame_idx}/{self.total_frames - 1}",
-            (20, DISPLAY_HEIGHT - 50),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.68,
-            (255, 255, 255),
-            2,
-        )
-        cv2.putText(
-            frame,
-            f"Predict Summary: now {snap.current_count} -> future {snap.future_count}, confidence {snap.confidence_percent:.1f}%",
-            (20, DISPLAY_HEIGHT - 22),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.65,
-            (0, 255, 255),
-            2,
-        )
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (left_x1, left_y1), (left_x2, left_y2), (12, 18, 25), -1)
+        cv2.rectangle(overlay, (right_x1, right_y1), (right_x2, right_y2), (28, 18, 45), -1)
+        cv2.addWeighted(overlay, 0.52, frame, 0.48, 0, frame)
+        cv2.rectangle(frame, (left_x1, left_y1), (left_x2, left_y2), (0, 220, 255), 2)
+        cv2.rectangle(frame, (right_x1, right_y1), (right_x2, right_y2), (0, 220, 255), 2)
+
+        current_nowcast = self._predict_current_nowcast()
+        nowcast_delta = int(current_nowcast - int(snap.current_count))
+        state_label = "ACTIVE" if (analysis.elapsed_percent >= PREDICTION_START_PERCENT and snap.nn_ready) else "WARMUP"
+        flow_label = self._flow_label(analysis.flow_vectors)
+        explain = self._safe_short(analysis.explanation, 90)
+
+        cv2.putText(frame, "Present Situation Crowd Detection", (32, 44), cv2.FONT_HERSHEY_SIMPLEX, 0.84, (0, 235, 255), 2)
+        cv2.putText(frame, f"Current: {snap.current_count}  Predicted Current: {current_nowcast}  Delta: {nowcast_delta:+d}", (32, 76), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255, 255, 255), 2)
+        cv2.putText(frame, f"Risk: {analysis.risk_status}  Congestion: {analysis.congestion_level:.2f}  Density: {analysis.density_ratio:.3f}", (32, 102), cv2.FONT_HERSHEY_SIMPLEX, 0.54, (120, 255, 160), 1)
+        cv2.putText(frame, f"Mode: LIVE_DETECTION  State: {state_label}  Flow: {flow_label}", (32, 124), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (225, 225, 225), 1)
+        cv2.putText(frame, f"Tracked IDs: {len(analysis.object_centers)}  Detected Boxes: {len(self.last_boxes)}", (32, 146), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (225, 225, 225), 1)
+        cv2.putText(frame, f"Recommendation: {analysis.recommendation}", (32, 168), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 255, 255), 1)
+        cv2.putText(frame, explain, (32, 190), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (230, 230, 230), 1)
+
+        if analysis.elapsed_percent < PREDICTION_START_PERCENT:
+            pending = PREDICTION_START_PERCENT - analysis.elapsed_percent
+            current_nowcast = self._predict_current_nowcast()
+            cv2.putText(frame, "Future Crowd Prediction", (840, 44), cv2.FONT_HERSHEY_SIMPLEX, 0.86, (0, 235, 255), 2)
+            cv2.putText(frame, "Status: Waiting for baseline analysis", (840, 84), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 255, 255), 2)
+            cv2.putText(frame, f"Prediction unlocks at {PREDICTION_START_PERCENT:.0f}% timeline", (840, 116), cv2.FONT_HERSHEY_SIMPLEX, 0.56, (225, 225, 225), 1)
+            cv2.putText(frame, f"Current progress: {analysis.elapsed_percent:.1f}%  |  Remaining: {pending:.1f}%", (840, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.54, (225, 225, 225), 1)
+            cv2.putText(frame, f"Current Crowd Prediction: {current_nowcast}", (840, 162), cv2.FONT_HERSHEY_SIMPLEX, 0.54, (220, 220, 220), 1)
+            cv2.putText(frame, "+20s prediction is enabled only after analysis threshold", (840, 184), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (200, 200, 200), 1)
+        else:
+            main_surge_label, main_surge_reason = self._surge_decision(
+                snap.gate_reason,
+                snap.incoming_probability_percent,
+                bool(snap.incoming),
+            )
+            horizon_text = self._format_future_horizon(analysis.frame_idx, min(self.total_frames - 1, analysis.frame_idx + self._future_horizon_frames()))
+            future_risk_text = analyze_risk(int(snap.current_count), int(snap.future_count), float(analysis.congestion_level))
+            conf_band, conf_color = self._confidence_band(snap.confidence_percent)
+            cv2.putText(frame, "Future Crowd Prediction", (840, 44), cv2.FONT_HERSHEY_SIMPLEX, 0.86, (0, 235, 255), 2)
+            cv2.putText(frame, f"Now: {snap.current_count}   Future: {snap.future_count}   Delta: {snap.delta:+d}", (840, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 255, 255), 2)
+            cv2.putText(frame, f"Confidence: {snap.confidence_percent:.1f}% ({conf_band})   Incoming Prob: {snap.incoming_probability_percent:.1f}%", (840, 112), cv2.FONT_HERSHEY_SIMPLEX, 0.56, conf_color, 1)
+            cv2.line(frame, (840, 126), (DISPLAY_WIDTH - 24, 126), (85, 85, 85), 1)
+            cv2.putText(frame, f"Current Crowd Tracking -> Observed: {snap.current_count} | Predicted Current: {current_nowcast}", (840, 146), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (225, 225, 225), 1)
+            cv2.putText(frame, f"Model State: {snap.prediction_mode} | Gate: {self._safe_short(snap.gate_reason, 22)}", (840, 164), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (220, 220, 220), 1)
+            cv2.putText(frame, f"Action: {snap.action_recommendation} | Streak: {snap.incoming_streak} | Surge: {main_surge_label}", (840, 182), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (130, 255, 170), 1)
+            cv2.putText(frame, f"Future Risk Status: {future_risk_text} | Horizon: {horizon_text}", (840, 200), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (230, 230, 230), 1)
+            if self.studio_forecast is not None:
+                sf = self.studio_forecast
+                studio_surge_label, _ = self._surge_decision(
+                    sf.gate_reason,
+                    sf.incoming_probability_percent,
+                    sf.incoming,
+                )
+                studio_text = (
+                    f"Studio @{sf.target_percent}%: {sf.predicted_count} ({sf.delta:+d}) risk {sf.future_risk_status} | surge {studio_surge_label}"
+                )
+                cv2.putText(frame, self._safe_short(studio_text, 62), (840, 222), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (220, 240, 170), 1)
+            else:
+                cv2.putText(frame, self._safe_short(f"Elapsed: {analysis.elapsed_percent:.1f}% | {main_surge_reason}", 62), (840, 222), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (220, 220, 220), 1)
 
     def render(self, force_predict: bool = False) -> None:
         analysis = self.analyze_to(self.current_frame_idx)
-        frame = self._read_frame(self.current_frame_idx)
+        frame = self._get_frame_for_render(self.current_frame_idx)
 
         if force_predict:
             self.last_predict_message = (
                 f"Predict @ frame {analysis.frame_idx}: now {analysis.count} -> future {analysis.future_count} "
-                f"(confidence {analysis.snapshot.confidence_percent:.1f}%) | {analysis.recommendation}"
+                f"(confidence {analysis.snapshot.confidence_percent:.1f}%, nowcast {self._predict_current_nowcast()}, horizon {self._format_future_horizon(analysis.frame_idx, min(self.total_frames - 1, analysis.frame_idx + self._future_horizon_frames()))}) | {analysis.recommendation}"
             )
 
         if self.overlay_enabled:
@@ -590,34 +1151,48 @@ class TimelineCrowdAnalyzer:
             frame = draw_heatmap(frame, self.last_boxes)
             draw_ids(frame, analysis.object_centers)
             frame = draw_flow(frame, self.tracker)
-            draw_text(frame, analysis.count, analysis.future_count, analysis.risk_status)
-            frame = draw_global_flow_indicator(frame, analysis.flow_vectors)
             frame = draw_high_crowd_popup(frame, self.last_boxes, analysis.risk_status in ("HIGH", "CRITICAL", "SURGE"))
-            frame = draw_future_prediction_popup(frame, analysis.snapshot, analysis.elapsed_percent, True)
 
         self._overlay_custom_panels(frame, analysis)
-        cv2.putText(frame, self.last_predict_message, (20, 136), cv2.FONT_HERSHEY_SIMPLEX, 0.57, (0, 255, 255), 2)
+        self._update_unique_gallery(frame)
+        status_overlay = frame.copy()
+        cv2.rectangle(status_overlay, (12, DISPLAY_HEIGHT - 46), (DISPLAY_WIDTH - 12, DISPLAY_HEIGHT - 8), (12, 16, 24), -1)
+        cv2.addWeighted(status_overlay, 0.46, frame, 0.54, 0, frame)
+        cv2.rectangle(frame, (12, DISPLAY_HEIGHT - 46), (DISPLAY_WIDTH - 12, DISPLAY_HEIGHT - 8), (0, 220, 255), 1)
+        cv2.putText(frame, self._safe_short(self.last_predict_message, 132), (20, DISPLAY_HEIGHT - 18), cv2.FONT_HERSHEY_SIMPLEX, 0.56, (0, 255, 255), 2)
 
         canvas = np.zeros((DISPLAY_HEIGHT + BUTTON_BAR_HEIGHT, DISPLAY_WIDTH, 3), dtype=np.uint8)
         canvas[:DISPLAY_HEIGHT, :] = frame
         self._draw_buttons(canvas)
         cv2.imshow(WINDOW_NAME, canvas)
+        cv2.imshow(PREVIEW_WINDOW_NAME, self._build_preview_frame())
 
     def on_seek(self, pos: int) -> None:
-        if self._ignore_trackbar_callback:
-            return
-        self.current_frame_idx = max(0, min(self.total_frames - 1, int(pos)))
-        self.running = False
-        self.render(force_predict=False)
+        _ = pos
 
     def _handle_button_action(self, key: str) -> None:
         if key == "run":
             self.running = True
+            self.last_predict_message = "Video running. Click Stop to pause, or Predict +20s for long-horizon forecast."
         elif key == "stop":
             self.running = False
+            self.last_predict_message = "Video paused. Use Predict +20s for explainable future simulation, or Run to continue."
         elif key == "predict":
             self.running = False
+            analysis = self.cache.get(self.current_frame_idx, self.analyze_to(self.current_frame_idx))
+            if analysis.elapsed_percent < PREDICTION_START_PERCENT:
+                self.last_predict_message = (
+                    f"Prediction blocked until {PREDICTION_START_PERCENT:.0f}% analysis. "
+                    f"Current: {analysis.elapsed_percent:.1f}%"
+                )
+                self.render(force_predict=False)
+                return
             self.render(force_predict=True)
+            self.last_predict_message = (
+                f"+20s forecast ready: now {analysis.snapshot.current_count} -> future {analysis.snapshot.future_count} "
+                f"(confidence {analysis.snapshot.confidence_percent:.1f}%, gate {analysis.snapshot.gate_reason})"
+            )
+            self.render(force_predict=False)
         elif key == "overlay":
             self.overlay_enabled = not self.overlay_enabled
             self.render(force_predict=False)
@@ -628,7 +1203,8 @@ class TimelineCrowdAnalyzer:
             self.running = False
             self.current_frame_idx = 0
             self._reset_analysis_state()
-            self.sync_trackbar()
+            self.studio_forecast = None
+            self.studio_candidate_forecast = None
             self.render(force_predict=False)
 
     def on_mouse(self, event: int, x: int, y: int, _flags: int, _param: object) -> None:
@@ -640,9 +1216,7 @@ class TimelineCrowdAnalyzer:
                 break
 
     def sync_trackbar(self) -> None:
-        self._ignore_trackbar_callback = True
-        cv2.setTrackbarPos("Timeline", WINDOW_NAME, int(self.current_frame_idx))
-        self._ignore_trackbar_callback = False
+        return
 
     def _close_and_write_summary(self) -> None:
         self.prediction_log.close()
@@ -681,25 +1255,116 @@ class TimelineCrowdAnalyzer:
             else:
                 f.write("## Top High-Risk Moments\n\n- No high-risk segments detected.\n")
 
+        os.makedirs(PREDICTION_RESULT_TXT_DIR, exist_ok=True)
+        video_name = os.path.splitext(os.path.basename(self.video_path))[0]
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        txt_path = os.path.join(PREDICTION_RESULT_TXT_DIR, f"main2_result_{video_name}_{timestamp}.txt")
+        txt_lines = [
+            "Main2 Crowd Prediction Result",
+            "=" * 40,
+            f"Video: {self.video_path}",
+            f"Frames analyzed: {len(self.count_history)}",
+            f"Runtime (sec): {runtime_sec:.2f}",
+            f"Peak crowd: {peak_count}",
+            f"Average crowd: {avg_count}",
+            f"High-risk events: {len(self.high_risk_events)}",
+            f"Incoming/forecast events: {len(self.prediction_events)}",
+        ]
+        if self.future_count_history:
+            peak_future = max(self.future_count_history)
+            avg_future = int(round(sum(self.future_count_history) / len(self.future_count_history)))
+            txt_lines.extend(
+                [
+                    f"Peak future forecast: {peak_future}",
+                    f"Average future forecast: {avg_future}",
+                ]
+            )
+        if self.future_risk_history:
+            risk_counts: Dict[str, int] = {}
+            for status in self.future_risk_history:
+                risk_counts[status] = risk_counts.get(status, 0) + 1
+            risk_line = ", ".join([f"{k}:{v}" for k, v in sorted(risk_counts.items())])
+            txt_lines.append(f"Future risk distribution: {risk_line}")
+        if self.count_history:
+            txt_lines.extend(
+                [
+                    "",
+                    "Recent Counts (last 20):",
+                    ", ".join(str(v) for v in self.count_history[-20:]),
+                ]
+            )
+        if self.prediction_events:
+            txt_lines.extend(
+                [
+                    "",
+                    "Recent Prediction Events (up to 10):",
+                ]
+            )
+            for event in self.prediction_events[-10:]:
+                txt_lines.append(
+                    f"- Frame {event.frame_idx}, elapsed {event.elapsed_percent:.2f}%: now {event.count} -> future {event.future_count}, risk {event.risk_status}, rec {event.recommendation}"
+                )
+
+        with open(txt_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(txt_lines) + "\n")
+
+        with open(PREDICTION_RESULT_TXT_LATEST, "w", encoding="utf-8") as f:
+            f.write("\n".join(txt_lines) + "\n")
+
+        future_summary_path = os.path.join(PREDICTION_RESULT_TXT_DIR, "future_prediction_summary_main2.json")
+        future_summary = {
+            "video": self.video_path,
+            "frames_analyzed": len(self.count_history),
+            "future_forecast_series_tail": self.future_count_history[-120:],
+            "future_risk_series_tail": self.future_risk_history[-120:],
+            "studio_forecast": {
+                "target_percent": self.studio_forecast.target_percent,
+                "target_frame": self.studio_forecast.target_frame,
+                "predicted_count": self.studio_forecast.predicted_count,
+                "delta": self.studio_forecast.delta,
+                "confidence_percent": self.studio_forecast.confidence_percent,
+                "future_risk_status": self.studio_forecast.future_risk_status,
+            } if self.studio_forecast is not None else None,
+        }
+        with open(future_summary_path, "w", encoding="utf-8") as f:
+            json.dump(future_summary, f, indent=2)
+
+        self.latest_result_txt_path = txt_path
+
     def run(self) -> None:
         cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+        cv2.namedWindow(PREVIEW_WINDOW_NAME, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(WINDOW_NAME, DISPLAY_WIDTH, DISPLAY_HEIGHT + BUTTON_BAR_HEIGHT)
+        cv2.resizeWindow(PREVIEW_WINDOW_NAME, PREVIEW_SIZE[0], PREVIEW_SIZE[1])
         cv2.setMouseCallback(WINDOW_NAME, self.on_mouse)
 
-        cv2.createTrackbar("Timeline", WINDOW_NAME, 0, max(1, self.total_frames - 1), self.on_seek)
         self.render(force_predict=False)
-        self.sync_trackbar()
 
         try:
             while True:
+                loop_started = time.perf_counter()
                 if self.running:
-                    self.current_frame_idx = min(self.total_frames - 1, self.current_frame_idx + 1)
+                    self.current_frame_idx = min(self.total_frames - 1, self.current_frame_idx + FAST_STEP_SIZE)
                     self.render(force_predict=self.auto_predict_enabled)
-                    self.sync_trackbar()
+
+                    render_elapsed = time.perf_counter() - loop_started
+                    if self.frame_budget_sec > 0 and render_elapsed > self.frame_budget_sec * 1.8:
+                        extra_steps = int(render_elapsed / self.frame_budget_sec) - 1
+                        if extra_steps > 0:
+                            self.current_frame_idx = min(self.total_frames - 1, self.current_frame_idx + min(5, extra_steps))
+
                     if self.current_frame_idx >= self.total_frames - 1:
                         self.running = False
+                        self.last_predict_message = "Video ended. Click Reboot Timeline to run again from start."
 
-                key = cv2.waitKey(8 if self.running else 30) & 0xFF
+                if self.running:
+                    spent_ms = int((time.perf_counter() - loop_started) * 1000.0)
+                    target_ms = max(1, int(self.frame_budget_sec * 1000.0))
+                    wait_ms = max(1, target_ms - spent_ms)
+                else:
+                    wait_ms = 22
+
+                key = cv2.waitKey(wait_ms) & 0xFF
                 if key == ord("q"):
                     break
                 if key == ord("r"):
@@ -714,8 +1379,17 @@ class TimelineCrowdAnalyzer:
                     self._handle_button_action("auto")
                 if key == ord("c"):
                     self._handle_button_action("reset")
+                if key == 81:
+                    self.running = False
+                    self.current_frame_idx = max(0, self.current_frame_idx - 10)
+                    self.render(force_predict=False)
+                if key == 83:
+                    self.running = False
+                    self.current_frame_idx = min(self.total_frames - 1, self.current_frame_idx + 10)
+                    self.render(force_predict=False)
         finally:
             self._close_and_write_summary()
+            print(f"[main2] Result TXT saved at: {self.latest_result_txt_path}")
             self.cap.release()
             cv2.destroyAllWindows()
 

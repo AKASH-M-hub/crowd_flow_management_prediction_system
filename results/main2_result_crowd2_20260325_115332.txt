@@ -1,0 +1,27 @@
+Main2 Crowd Prediction Result
+========================================
+Video: D:/projects/Crowd_System_AI/data/crowd_videos/crowd2.mp4
+Frames analyzed: 484
+Runtime (sec): 1907.94
+Peak crowd: 21
+Average crowd: 14
+High-risk events: 0
+Incoming/forecast events: 28
+Peak future forecast: 18
+Average future forecast: 15
+Future risk distribution: SAFE:484
+
+Recent Counts (last 20):
+12, 13, 13, 13, 13, 13, 13, 12, 12, 12, 14, 14, 14, 11, 11, 11, 11, 11, 11, 14
+
+Recent Prediction Events (up to 10):
+- Frame 1402, elapsed 69.44%: now 14 -> future 17, risk SAFE, rec WATCH_ENTRY_POINTS
+- Frame 1413, elapsed 69.99%: now 13 -> future 16, risk SAFE, rec WATCH_ENTRY_POINTS
+- Frame 1415, elapsed 70.08%: now 13 -> future 16, risk SAFE, rec WATCH_ENTRY_POINTS
+- Frame 1416, elapsed 70.13%: now 13 -> future 16, risk SAFE, rec WATCH_ENTRY_POINTS
+- Frame 369, elapsed 18.28%: now 13 -> future 16, risk SAFE, rec WATCH_ENTRY_POINTS
+- Frame 370, elapsed 18.33%: now 13 -> future 17, risk SAFE, rec WATCH_ENTRY_POINTS
+- Frame 371, elapsed 18.38%: now 13 -> future 16, risk SAFE, rec PREPARE_MARSHAL_TEAM
+- Frame 372, elapsed 18.42%: now 13 -> future 16, risk SAFE, rec PREPARE_MARSHAL_TEAM
+- Frame 373, elapsed 18.47%: now 13 -> future 16, risk SAFE, rec PREPARE_MARSHAL_TEAM
+- Frame 441, elapsed 21.84%: now 12 -> future 15, risk SAFE, rec WATCH_ENTRY_POINTS

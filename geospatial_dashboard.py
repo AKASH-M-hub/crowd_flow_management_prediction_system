@@ -124,6 +124,16 @@ def _call_nominatim_search(query: str, limit: int = 5) -> Dict[str, Any]:
     return {"ok": True, "payload": payload}
 
 
+def _compose_structured_query(category: str, place: str, state: str, country: str) -> str:
+    parts = [
+        category.strip(),
+        place.strip(),
+        state.strip(),
+        country.strip(),
+    ]
+    return ", ".join([part for part in parts if part])
+
+
 def _extract_coords(payload: Dict[str, Any]) -> List[Dict[str, float]]:
     coords = payload.get("coordinates", [])
     out = []
@@ -187,13 +197,19 @@ def api_geospatial_evaluate():
 @app.route("/api/geospatial/geocode", methods=["POST"])
 def api_geocode():
     payload = request.get_json(force=True, silent=True) or {}
+    category = str(payload.get("category", "")).strip()
+    place = str(payload.get("place", "")).strip()
+    state = str(payload.get("state", "")).strip()
+    country = str(payload.get("country", "")).strip()
     query = str(payload.get("query", "")).strip()
+    if not query:
+        query = _compose_structured_query(category, place, state, country)
     autocomplete_mode = bool(payload.get("autocomplete", False))
     default_limit = 12 if autocomplete_mode else 5
     limit = int(payload.get("limit", default_limit) or default_limit)
     limit = max(1, min(limit, 25))
     if not query:
-        return jsonify({"error": "query is required."}), 400
+        return jsonify({"error": "query is required. Provide free text or structured fields."}), 400
 
     if _maps_provider() == "google":
         api_result = _call_google_api(GOOGLE_GEOCODE_URL, {"address": query})
@@ -219,6 +235,10 @@ def api_geocode():
         return jsonify({
             "status": "OK",
             "results": mapped_results,
+            "query_meta": {
+                "mode": "structured" if any([category, place, state, country]) else "free_text",
+                "query": query,
+            },
         })
 
     api_result = _call_nominatim_search(query=query, limit=limit)
@@ -237,6 +257,10 @@ def api_geocode():
     return jsonify({
         "status": "OK" if results else "ZERO_RESULTS",
         "results": results,
+        "query_meta": {
+            "mode": "structured" if any([category, place, state, country]) else "free_text",
+            "query": query,
+        },
     })
 
 
@@ -289,8 +313,13 @@ def _overpass_filter(place_type: str, keyword: str) -> List[str]:
     key = place_type.strip().lower()
     mapping = {
         "hospital": ['["amenity"="hospital"]'],
+        "college": ['["amenity"="college"]', '["amenity"="university"]'],
+        "engineering_college": ['["amenity"="college"]["name"~"engineering",i]', '["amenity"="university"]["name"~"engineering",i]'],
         "police": ['["amenity"="police"]'],
         "school": ['["amenity"="school"]'],
+        "bus_stop": ['["highway"="bus_stop"]', '["public_transport"="platform"]'],
+        "traffic_signal": ['["highway"="traffic_signals"]'],
+        "building": ['["building"]'],
         "shopping_mall": ['["shop"="mall"]', '["building"="retail"]'],
         "transit_station": ['["public_transport"]', '["railway"="station"]', '["highway"="bus_stop"]'],
     }

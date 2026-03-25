@@ -59,8 +59,14 @@
     .list-item:hover { color: #0f3d8f; }
     .list-item:last-child { border-bottom: none; }
     .inline-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+    .quad-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
     .triple-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
     select, input[type="number"] { width: 100%; padding: 8px; border: 1px solid #b8c2d6; border-radius: 6px; }
+    .results-list { max-height: 210px; overflow-y: auto; border: 1px solid #e2e8f0; border-radius: 6px; padding: 8px; background: #fbfdff; }
+    .result-row { padding: 8px; border-bottom: 1px solid #edf2f7; cursor: pointer; }
+    .result-row:hover { background: #f0f6ff; }
+    .result-row:last-child { border-bottom: none; }
+    .workflow { background: linear-gradient(135deg, #e7f7ee 0%, #eef7ff 100%); border: 1px solid #cce5d8; border-radius: 8px; padding: 8px; }
     .leaflet-control-zoom a { width: 34px !important; height: 34px !important; line-height: 34px !important; font-size: 18px !important; }
     .legend { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
     .badge { padding: 4px 8px; border-radius: 999px; font-size: 11px; font-weight: 700; color: #fff; }
@@ -97,6 +103,7 @@
       .wrap { grid-template-columns: 1fr; }
       #map { height: 56vh; }
       .triple-grid { grid-template-columns: 1fr; }
+      .quad-grid { grid-template-columns: 1fr; }
     }
   </style>
 </head>
@@ -110,13 +117,38 @@
     <div>
       <div class="row panel">
         <div class="row search-wrap">
-          <label for="placeSearch">Target Place Search</label>
-          <input id="placeSearch" type="text" placeholder="Type place name (example: Guduvanchery, Chennai, Madurai)" autocomplete="off" />
-          <div class="field-note">Type at least 3 letters to see suggestions and click one option to jump to that location.</div>
+          <label for="placeSearch">Quick Place Search</label>
+          <input id="placeSearch" type="text" placeholder="Example: college near Vandalur Chennai" autocomplete="off" />
+          <div class="field-note">Use detailed search phrases for better accuracy. Example: engineering college in Tamil Nadu India.</div>
           <div id="placeSuggestions" class="suggestions"></div>
         </div>
         <div class="row">
           <button id="btnEvaluate">Calculate Capacity</button>
+        </div>
+        <div class="panel" style="margin-top: 8px;">
+          <div style="font-weight:700; font-size:13px; margin-bottom:6px;">Structured Nominatim Search</div>
+          <div class="quad-grid">
+            <div>
+              <label class="small" for="structuredCategory">Category</label>
+              <input id="structuredCategory" type="text" placeholder="engineering college" />
+            </div>
+            <div>
+              <label class="small" for="structuredPlace">Place</label>
+              <input id="structuredPlace" type="text" placeholder="Vandalur Chennai" />
+            </div>
+            <div>
+              <label class="small" for="structuredState">State</label>
+              <input id="structuredState" type="text" placeholder="Tamil Nadu" />
+            </div>
+            <div>
+              <label class="small" for="structuredCountry">Country</label>
+              <input id="structuredCountry" type="text" value="India" />
+            </div>
+          </div>
+          <div style="margin-top:8px;">
+            <button id="btnStructuredSearch" class="secondary">Search with Structure</button>
+          </div>
+          <div class="field-note">Best practice: always include category + place + state/country.</div>
         </div>
         <div class="row inline-grid">
           <div>
@@ -180,6 +212,45 @@
         <h3 style="margin: 0 0 8px 0;">Map Services</h3>
         <div id="mapsHealth">Checking...</div>
       </div>
+
+      <div class="panel row">
+        <h3 style="margin: 0 0 8px 0;">Overpass Data Extraction</h3>
+        <div class="triple-grid">
+          <div>
+            <label class="small" for="overpassType">OSM Entity Type</label>
+            <select id="overpassType">
+              <option value="hospital">Hospitals</option>
+              <option value="bus_stop">Bus Stops</option>
+              <option value="traffic_signal">Traffic Signals</option>
+              <option value="building">Buildings</option>
+              <option value="college">Colleges</option>
+              <option value="engineering_college">Engineering Colleges</option>
+              <option value="transit_station">Transit Stations</option>
+            </select>
+          </div>
+          <div>
+            <label class="small" for="overpassRadius">Radius (m)</label>
+            <input id="overpassRadius" type="number" min="100" max="20000" value="1200" />
+          </div>
+          <div>
+            <label class="small" for="overpassKeyword">Name Filter (Optional)</label>
+            <input id="overpassKeyword" type="text" placeholder="example: government" />
+          </div>
+        </div>
+        <div style="margin-top:8px;">
+          <button id="btnOverpassExtract">Extract OSM Data</button>
+        </div>
+        <div class="small" id="overpassSummary" style="margin-top:8px;">Select or draw a zone, then extract OSM entities around its centroid.</div>
+        <div id="overpassResults" class="results-list" style="margin-top:8px;"></div>
+      </div>
+
+      <div class="panel row workflow">
+        <h3 style="margin: 0 0 8px 0;">Pro Workflow</h3>
+        <div class="small">1. Use structured search (category + place + state + country).</div>
+        <div class="small">2. Auto-mark or draw target zone.</div>
+        <div class="small">3. Extract OSM entities via Overpass.</div>
+        <div class="small">4. Evaluate capacity and use dedicated mobile apps (Organic Maps / OsmAnd) for field navigation.</div>
+      </div>
     </div>
   </div>
 
@@ -198,6 +269,7 @@
     let reverseGeocodeTimer = null;
     let isDrawingShape = false;
     let suppressMapClickUntil = 0;
+    let overpassLayer = null;
 
     function clearShape() {
       if (selectedLayer) {
@@ -321,11 +393,11 @@
       centroidMarker = L.marker([centroid.lat, centroid.lng]).addTo(map);
     }
 
-    async function geocodeAddress(query) {
+    async function geocodeAddress(payload) {
       const res = await fetch('/api/geospatial/geocode', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ query })
+        body: JSON.stringify(payload)
       });
       const data = await res.json();
       if (!res.ok) {
@@ -540,12 +612,119 @@
         return;
       }
       try {
-        const result = await geocodeAddress(query);
+        const result = await geocodeAddress({ query });
         map.setView([result.lat, result.lng], 14);
         await applyAutoZoneFromPoint(result.lat, result.lng, 'Manual place search', true);
       } catch (error) {
         alert(error.message || 'Location search failed');
       }
+    }
+
+    async function focusStructuredLocation() {
+      const category = document.getElementById('structuredCategory').value.trim();
+      const place = document.getElementById('structuredPlace').value.trim();
+      const state = document.getElementById('structuredState').value.trim();
+      const country = document.getElementById('structuredCountry').value.trim();
+
+      if (!category && !place && !state && !country) {
+        alert('Provide at least one structured search field.');
+        return;
+      }
+
+      try {
+        const result = await geocodeAddress({ category, place, state, country });
+        map.setView([result.lat, result.lng], 14);
+        await applyAutoZoneFromPoint(result.lat, result.lng, 'Structured Nominatim search', true);
+      } catch (error) {
+        alert(error.message || 'Structured search failed');
+      }
+    }
+
+    function clearOverpassLayer() {
+      if (!overpassLayer) {
+        overpassLayer = L.layerGroup().addTo(map);
+      }
+      overpassLayer.clearLayers();
+    }
+
+    function renderOverpassList(items, markerRefs) {
+      const node = document.getElementById('overpassResults');
+      node.innerHTML = '';
+
+      if (!items.length) {
+        node.innerHTML = '<div class="small">No matching OSM entities in selected radius.</div>';
+        return;
+      }
+
+      items.forEach((item, index) => {
+        const row = document.createElement('div');
+        row.className = 'result-row';
+        const types = Array.isArray(item.types) ? item.types.filter(Boolean).join(', ') : 'osm_place';
+        row.innerHTML = '<div style="font-weight:700; font-size:12px;">' + (item.name || 'Unnamed') + '</div>' +
+          '<div class="small">' + (item.vicinity || 'Unknown vicinity') + '</div>' +
+          '<div class="small">Type: ' + types + '</div>';
+        row.addEventListener('click', () => {
+          const marker = markerRefs[index];
+          if (!marker) {
+            return;
+          }
+          const ll = marker.getLatLng();
+          map.setView([ll.lat, ll.lng], Math.max(15, map.getZoom()));
+          marker.openPopup();
+        });
+        node.appendChild(row);
+      });
+    }
+
+    async function extractOverpassData() {
+      if (!selectedCoordinates.length) {
+        alert('Select a location first by map click, search, or drawing a zone.');
+        return;
+      }
+
+      const placeType = document.getElementById('overpassType').value;
+      const radius = Number(document.getElementById('overpassRadius').value || 1200);
+      const keyword = document.getElementById('overpassKeyword').value.trim();
+
+      const res = await fetch('/api/geospatial/nearby-places', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          coordinates: selectedCoordinates,
+          place_type: placeType,
+          radius_m: radius,
+          keyword,
+        })
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        alert(data.error || 'Overpass extraction failed');
+        return;
+      }
+
+      clearOverpassLayer();
+      const markers = [];
+      const renderedPlaces = [];
+      const places = Array.isArray(data.places) ? data.places : [];
+      places.forEach((item) => {
+        if (!item.location || !Number.isFinite(item.location.lat) || !Number.isFinite(item.location.lng)) {
+          return;
+        }
+        const marker = L.circleMarker([item.location.lat, item.location.lng], {
+          radius: 5,
+          color: '#0f766e',
+          fillColor: '#14b8a6',
+          fillOpacity: 0.75,
+          weight: 1,
+        }).addTo(overpassLayer);
+        marker.bindPopup('<strong>' + (item.name || 'Unnamed Place') + '</strong><br/>' + (item.vicinity || 'Unknown vicinity'));
+        markers.push(marker);
+        renderedPlaces.push(item);
+      });
+
+      renderOverpassList(renderedPlaces, markers);
+      document.getElementById('overpassSummary').textContent =
+        'Extracted ' + (data.count || 0) + ' entities for ' + (data.place_type || placeType) + ' within ' + (data.radius_m || radius) + ' m.';
     }
 
     function initMap() {
@@ -644,10 +823,19 @@
       });
 
       document.getElementById('btnEvaluate').addEventListener('click', evaluateSelectedZone);
+      document.getElementById('btnStructuredSearch').addEventListener('click', focusStructuredLocation);
+      document.getElementById('btnOverpassExtract').addEventListener('click', extractOverpassData);
       document.getElementById('placeSearch').addEventListener('keydown', (event) => {
         if (event.key === 'Enter') {
           event.preventDefault();
           focusSearchLocation();
+        }
+      });
+
+      document.getElementById('structuredCountry').addEventListener('keydown', (event) => {
+        if (event.key === 'Enter') {
+          event.preventDefault();
+          focusStructuredLocation();
         }
       });
 

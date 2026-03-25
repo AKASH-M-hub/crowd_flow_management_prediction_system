@@ -1,0 +1,24 @@
+Main2 Crowd Prediction Result
+========================================
+Video: D:/projects/Crowd_System_AI/data/crowd_videos/crowd2.mp4
+Frames analyzed: 2019
+Runtime (sec): 2655.38
+Peak crowd: 22
+Average crowd: 13
+High-risk events: 0
+Incoming/forecast events: 66
+
+Recent Counts (last 20):
+11, 9, 9, 14, 14, 9, 9, 12, 12, 9, 9, 12, 12, 11, 11, 12, 12, 9, 9, 11
+
+Recent Prediction Events (up to 10):
+- Frame 1630, elapsed 80.73%: now 14 -> future 17, risk SAFE, rec WATCH_ENTRY_POINTS
+- Frame 1749, elapsed 86.63%: now 14 -> future 17, risk SAFE, rec WATCH_ENTRY_POINTS
+- Frame 1990, elapsed 98.56%: now 10 -> future 13, risk SAFE, rec WATCH_ENTRY_POINTS
+- Frame 1991, elapsed 98.61%: now 10 -> future 13, risk SAFE, rec WATCH_ENTRY_POINTS
+- Frame 1992, elapsed 98.66%: now 10 -> future 13, risk SAFE, rec PREPARE_MARSHAL_TEAM
+- Frame 1993, elapsed 98.71%: now 10 -> future 13, risk SAFE, rec PREPARE_MARSHAL_TEAM
+- Frame 1995, elapsed 98.81%: now 10 -> future 14, risk SAFE, rec WATCH_ENTRY_POINTS
+- Frame 1997, elapsed 98.91%: now 10 -> future 13, risk SAFE, rec WATCH_ENTRY_POINTS
+- Frame 1999, elapsed 99.01%: now 10 -> future 13, risk SAFE, rec WATCH_ENTRY_POINTS
+- Frame 2002, elapsed 99.16%: now 10 -> future 13, risk SAFE, rec WATCH_ENTRY_POINTS
